@@ -27,7 +27,22 @@ class build_ext_cppstd(build_ext):
             self.compiler._compile = orig
 
 
-SEQ_SRC = os.environ.get('SEQARRAY_SRC', os.path.join('..', 'SeqArray', 'src'))
+# Vendored SeqArray engine sources (self-contained; no external dependency).
+# Canonical layout: seqarray/upstream (pristine baseline) + seqarray/src (the
+# PySeqArray working copy with local patches).  Auto-detect so the build is
+# robust; override with SEQARRAY_SRC=/path/to/SeqArray/src for a fresh checkout.
+def _find_seq_src():
+    env = os.environ.get('SEQARRAY_SRC')
+    if env:
+        return env
+    for cand in (os.path.join('seqarray', 'src'),
+                 os.path.join('csrc', 'seqarray'),
+                 os.path.join('..', 'SeqArray', 'src')):
+        if os.path.exists(os.path.join(cand, 'SeqArray.cpp')):
+            return cand
+    raise RuntimeError("vendored SeqArray sources not found (set SEQARRAY_SRC)")
+
+SEQ_SRC = _find_seq_src()
 
 # B1 read path: SeqArray engine TUs that the Rinternals shim must support.
 SEQARRAY_TUS = [os.path.join(SEQ_SRC, fn) for fn in [
@@ -45,7 +60,8 @@ SEQARRAY_TUS = [os.path.join(SEQ_SRC, fn) for fn in [
     'FileMerge.cpp',
 ]]
 
-SHIM_TUS = ['csrc/cclib.cpp', 'csrc/Rshim.cpp', 'csrc/gds_bridge.cpp', 'csrc/conn.cpp']
+SHIM_TUS = ['csrc/cclib.cpp', 'csrc/Rshim.cpp', 'csrc/gds_bridge.cpp',
+            'csrc/conn.cpp', 'csrc/native_api.cpp']
 
 ext = Extension(
     'PySeqArray.cclib',

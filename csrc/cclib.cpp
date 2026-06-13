@@ -16,6 +16,7 @@
 #include <PyGDS2.h>                 // GDS_* capsule wrappers + Init_GDS_Routines
 #include "Rshim/Rshim_cpp.h"       // SEXP cell, Rsh_init_globals, Rsh_arena_reset
 #include "Rshim/Rshim_error.h"     // Rsh_error
+#include "native_api.h"            // SEXP-free native entry layer (option B)
 
 // ---- SeqArray engine entry points (subset wired in B1) ----------------------
 extern "C" {
@@ -241,6 +242,10 @@ static PyMethodDef cclib_methods[] = {
     {"reset_filter",    w_reset_filter,    METH_VARARGS, "Reset selection to all (fileid, sample=1, variant=1)."},
     {"get_sample_sel",  w_get_sample_sel,  METH_VARARGS, "SEQ_GetSpaceSample(fileid) -> logical selection."},
     {"get_variant_sel", w_get_variant_sel, METH_VARARGS, "SEQ_GetSpaceVariant(fileid) -> logical selection."},
+    // SEXP-free native entry layer (option B)
+    {"n_dims",          PySeq_native_dims,           METH_VARARGS, "Native: (nSamp,nVar,ploidy,nSampSel,nVarSel) via CFileInfo, no SEXP."},
+    {"native_sample_sel", PySeq_native_get_sample_sel, METH_VARARGS, "Native sample selection (bool) via TSelection, no SEXP."},
+    {"native_variant_sel", PySeq_native_get_variant_sel, METH_VARARGS, "Native variant selection (bool) via TSelection, no SEXP."},
     {NULL, NULL, 0, NULL}
 };
 
