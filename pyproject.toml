@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "PySeqArray"
+version = "0.1.0"
+description = "Data management of whole-genome sequencing variants with SeqArray GDS files in Python"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "GPL-3.0-or-later" }
+dependencies = ["numpy>=1.20", "pygds"]
+
+[project.urls]
+Homepage = "https://github.com/CoreArray/PySeqArray"
+
+[tool.setuptools]
+packages = ["PySeqArray"]
