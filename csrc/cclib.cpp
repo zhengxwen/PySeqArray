@@ -246,6 +246,8 @@ static PyMethodDef cclib_methods[] = {
     {"n_dims",          PySeq_native_dims,           METH_VARARGS, "Native: (nSamp,nVar,ploidy,nSampSel,nVarSel) via CFileInfo, no SEXP."},
     {"native_sample_sel", PySeq_native_get_sample_sel, METH_VARARGS, "Native sample selection (bool) via TSelection, no SEXP."},
     {"native_variant_sel", PySeq_native_get_variant_sel, METH_VARARGS, "Native variant selection (bool) via TSelection, no SEXP."},
+    {"native_genotype", PySeq_native_genotype, METH_VARARGS, "Native genotype (nVar,nSamp,ploidy) int32, NA_INTEGER=missing, no SEXP."},
+    {"native_dosage", PySeq_native_dosage, METH_VARARGS, "Native dosage (nVar,nSamp) int32; arg alt=0 ref/1 alt; no SEXP."},
     {NULL, NULL, 0, NULL}
 };
 

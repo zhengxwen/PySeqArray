@@ -65,11 +65,20 @@ def seqClose(f):
 def seqGetData(f, name, use_raw=False):
     """Read field ``name`` for the current selection, via the SeqArray engine.
 
-    Returns a numpy array (multi-dimensional fields come back in numpy C-order,
-    i.e. reversed relative to R's column-major dims), a list (for string / list
-    fields), or ``None``.  Genotype/missing integer fields use R's ``NA_INTEGER``
-    (-2147483648) sentinel; use :func:`na_mask` to locate missing entries.
+    The genotype-family fields (``"genotype"``, ``"$dosage"``, ``"$dosage_alt"``)
+    take the SEXP-free native path (``cclib.native_*``, driving the engine's
+    CApply_Variant_* readers straight into numpy); everything else uses the engine
+    entry point.  Returns a numpy array (multi-dimensional fields in numpy C-order,
+    reversed relative to R's column-major dims), a list, or ``None``.  Missing
+    integer entries use R's ``NA_INTEGER`` (-2147483648); see :func:`na_mask`.
     """
+    if not use_raw:
+        if name == "genotype":
+            return cclib.native_genotype(f.fileid)
+        if name == "$dosage":
+            return cclib.native_dosage(f.fileid, 0)
+        if name == "$dosage_alt":
+            return cclib.native_dosage(f.fileid, 1)
     return cclib.get_data(f.fileid, name, 1 if use_raw else 0)
 
 

@@ -7,5 +7,7 @@
 PyObject *PySeq_native_dims(PyObject *, PyObject *args);
 PyObject *PySeq_native_get_sample_sel(PyObject *, PyObject *args);
 PyObject *PySeq_native_get_variant_sel(PyObject *, PyObject *args);
+PyObject *PySeq_native_genotype(PyObject *, PyObject *args);
+PyObject *PySeq_native_dosage(PyObject *, PyObject *args);
 
 #endif  // PYSEQARRAY_NATIVE_API_H_
