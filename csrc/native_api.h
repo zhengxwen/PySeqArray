@@ -5,6 +5,7 @@
 #include <Python.h>
 
 PyObject *PySeq_native_file_init(PyObject *, PyObject *args);
+PyObject *PySeq_native_file_done(PyObject *, PyObject *args);
 PyObject *PySeq_native_set_sample(PyObject *, PyObject *args);
 PyObject *PySeq_native_set_variant(PyObject *, PyObject *args);
 PyObject *PySeq_native_reset(PyObject *, PyObject *args);

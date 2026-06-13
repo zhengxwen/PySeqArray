@@ -14,6 +14,7 @@
 #include <numpy/arrayobject.h>
 
 #include <cstring>
+#include <map>
 
 #include "Rshim/Rshim_error.h"
 #include "native_api.h"
@@ -84,6 +85,23 @@ PyObject *PySeq_native_file_init(PyObject *, PyObject *args)
     if (!PyArg_ParseTuple(args, "i", &fid)) return NULL;
     return native_guard([&]() -> PyObject * {
         GetFileInfo(fid).Selection();   // force selection to initialize (all TRUE)
+        Py_RETURN_NONE;
+    });
+}
+
+// Drop the engine's cached CFileInfo for this file id (the SEXP-free analog of
+// SEQ_File_Done).  MUST be called when closing a file: pygds recycles file-id
+// integers, and GetFileInfo(int) skips ResetRoot when a stale entry's Root()
+// pointer happens to match a reused root address -> it would otherwise return the
+// previous file's variant count and selection.
+PyObject *PySeq_native_file_done(PyObject *, PyObject *args)
+{
+    int fid;
+    if (!PyArg_ParseTuple(args, "i", &fid)) return NULL;
+    return native_guard([&]() -> PyObject * {
+        std::map<int, CFileInfo>::iterator it = GDSFile_ID_Info.find(fid);
+        if (it != GDSFile_ID_Info.end())
+            GDSFile_ID_Info.erase(it);
         Py_RETURN_NONE;
     });
 }

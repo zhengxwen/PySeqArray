@@ -5,6 +5,7 @@ SeqArray engine.  ``seqAddValue`` / ``seqDelete`` require the file to have been
 opened with ``readonly=False``.
 """
 
+import numpy as np
 import pygds
 
 
@@ -80,4 +81,48 @@ def seqRecompress(filename, compress="LZMA_RA", verbose=True):
     pygds.cleanup_gds(str(filename), verbose=False)   # defragment
     if verbose:
         print(f"seqRecompress: recompressed {n[0]} nodes in {filename}")
+    return str(filename)
+
+
+def _make_transpose(root, folder, storage, compress, verbose):
+    """(Re)build the sample-major ``~data`` twin next to ``<folder>/data``.
+
+    ``genotype/data`` is numpy ``[page, sample, ploidy]`` -> twin ``[sample, page,
+    ploidy]`` (swap the first two axes); ``phase/data`` is ``[variant, sample]``
+    -> twin ``[sample, variant]`` (plain transpose).  Values are copied verbatim
+    (the same bit2/bit1 codes), only the layout changes.
+    """
+    dpath = folder + "/data"
+    if not root.exist(dpath):
+        return
+    raw = np.asarray(root.index(dpath).read())
+    tdata = (np.transpose(raw, (1, 0, 2)) if raw.ndim == 3 else raw.T)
+    tdata = np.ascontiguousarray(tdata)
+    tpath = folder + "/~data"
+    if root.exist(tpath):
+        root.index(tpath).delete(force=True)
+    root.index(folder).add("~data", val=tdata, storage=storage,
+                           compress=compress)
+    if verbose:
+        print(f"  transpose {tpath} {tuple(tdata.shape)}")
+
+
+def seqTranspose(filename, compress="LZMA_RA", verbose=True):
+    """(Re)build the transposed ``~data`` twins for ``genotype`` and ``phase``.
+
+    These sample-major copies accelerate by-sample iteration in tools (e.g. R
+    SeqArray) that look for them.  Operates in place, then defragments.
+    """
+    g = pygds.gdsfile()
+    g.open(str(filename), readonly=False)
+    try:
+        if verbose:
+            print(f"Transpose {filename}")
+        root = g.root()
+        _make_transpose(root, "genotype", "bit2", compress, verbose)
+        _make_transpose(root, "phase", "bit1", compress, verbose)
+        g.sync()
+    finally:
+        g.close()
+    pygds.cleanup_gds(str(filename), verbose=False)
     return str(filename)

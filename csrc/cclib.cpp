@@ -28,6 +28,7 @@ static PyMethodDef cclib_methods[] = {
     {"init_gds",        py_init_gds,                 METH_NOARGS,  "Bind the pygds GDS C-API capsule."},
     // selection / file
     {"file_init",       PySeq_native_file_init,      METH_VARARGS, "Initialise selection to all (fileid)."},
+    {"file_done",       PySeq_native_file_done,      METH_VARARGS, "Drop the engine's cached CFileInfo (fileid); call on close."},
     {"set_sample",      PySeq_native_set_sample,     METH_VARARGS, "Set sample selection (fileid, bool_mask, intersect=0)."},
     {"set_variant",     PySeq_native_set_variant,    METH_VARARGS, "Set variant selection (fileid, bool_mask, intersect=0)."},
     {"reset_filter",    PySeq_native_reset,          METH_VARARGS, "Reset selection to all (fileid, sample=1, variant=1)."},

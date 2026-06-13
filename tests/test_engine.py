@@ -204,6 +204,123 @@ def test_gds2vcf_roundtrip():
             os.remove(p)
 
 
+def _open_biallelic():
+    """Open the example file with the selection restricted to biallelic variants
+    (PLINK BED / SNPRelate only represent biallelic genotypes)."""
+    f = sa.seqOpen(sa.seqExampleFileName("gds"))
+    allele = np.asarray(f.gds.index("allele").read())
+    nall = np.array([str(a).count(",") + 1 for a in allele])
+    sa.seqSetFilter(f, variant_sel=(nall == 2), verbose=False)
+    return f
+
+
+def test_bed_roundtrip():
+    """GDS -> PLINK BED -> GDS preserves the full genotype (biallelic subset)."""
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    prefix = os.path.join(tmp, "plink")
+    out = os.path.join(tmp, "rt_bed.gds")
+    f = _open_biallelic()
+    try:
+        g0 = np.asarray(sa.seqGetData(f, "genotype"))
+        d0 = np.asarray(sa.seqGetData(f, "$dosage_alt"))
+        sa.seqGDS2BED(f, prefix, verbose=False)
+    finally:
+        sa.seqClose(f)
+    for ext in ("bed", "bim", "fam"):
+        assert os.path.getsize(prefix + "." + ext) > 0
+    sa.seqBED2GDS(prefix, out, compress="", verbose=False)
+    f2 = sa.seqOpen(out)
+    try:
+        assert f2.nvar() == g0.shape[0] and f2.nsamp() == 90
+        g1 = np.asarray(sa.seqGetData(f2, "genotype"))
+        d1 = np.asarray(sa.seqGetData(f2, "$dosage_alt"))
+        # genotype: missing pattern + dosage preserved
+        assert np.array_equal(sa.na_mask(g0), sa.na_mask(g1))
+        assert np.array_equal(d0, d1)
+    finally:
+        sa.seqClose(f2)
+
+
+def test_snp_roundtrip():
+    """GDS -> SNPRelate GDS -> GDS preserves the reference-allele dosage."""
+    import tempfile
+    import pygds
+    tmp = tempfile.mkdtemp()
+    snp = os.path.join(tmp, "x.snpgds")
+    out = os.path.join(tmp, "rt_snp.gds")
+    f = _open_biallelic()
+    try:
+        d0 = np.asarray(sa.seqGetData(f, "$dosage"))
+        af0 = sa.seqAlleleFreq(f)
+        sa.seqGDS2SNP(f, snp, compress="", verbose=False)
+    finally:
+        sa.seqClose(f)
+    # the SNPRelate file carries the [sample, snp] orientation marker
+    gg = pygds.gdsfile(); gg.open(snp)
+    try:
+        assert "sample.order" in gg.root().index("genotype").getattr()
+        assert gg.root().index("genotype").description()["dim"] == [90, d0.shape[0]]
+    finally:
+        gg.close()
+    sa.seqSNP2GDS(snp, out, compress="", verbose=False)
+    f2 = sa.seqOpen(out)
+    try:
+        assert np.array_equal(d0, np.asarray(sa.seqGetData(f2, "$dosage")))
+        assert np.allclose(af0, sa.seqAlleleFreq(f2), equal_nan=True)
+    finally:
+        sa.seqClose(f2)
+
+
+def test_merge():
+    """seqMerge concatenates variants of two copies -> doubled counts/genotype."""
+    import tempfile
+    import warnings
+    tmp = tempfile.mkdtemp()
+    out = os.path.join(tmp, "merged.gds")
+    src = sa.seqExampleFileName("gds")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sa.seqMerge([src, src], out, compress="", verbose=False)
+    f = sa.seqOpen(out)
+    try:
+        assert f.nvar() == 2 * 1348 and f.nsamp() == 90
+        g = np.asarray(sa.seqGetData(f, "genotype"))
+        nm = sa.na_mask(g)
+        assert int(g[~nm].sum()) == 2 * 32683
+        assert int(nm.sum()) == 2 * 17216
+        pos = np.asarray(sa.seqGetData(f, "position"))
+        assert np.array_equal(pos[:1348], pos[1348:])
+    finally:
+        sa.seqClose(f)
+
+
+def test_transpose_twins():
+    """seqTranspose rebuilds genotype/phase ~data twins == the original file's."""
+    import tempfile
+    import shutil
+    import pygds
+    tmp = tempfile.mkdtemp()
+    dst = os.path.join(tmp, "copy.gds")
+    shutil.copy(sa.seqExampleFileName("gds"), dst)
+    g = pygds.gdsfile(); g.open(dst)
+    gt0 = np.asarray(g.root().index("genotype/~data").read())
+    ph0 = np.asarray(g.root().index("phase/~data").read())
+    g.close()
+    # delete the twins, then rebuild them
+    g = pygds.gdsfile(); g.open(dst, readonly=False)
+    g.root().index("genotype/~data").delete(force=True)
+    g.root().index("phase/~data").delete(force=True)
+    g.sync(); g.close()
+    sa.seqTranspose(dst, compress="", verbose=False)
+    g = pygds.gdsfile(); g.open(dst)
+    try:
+        assert np.array_equal(gt0, np.asarray(g.root().index("genotype/~data").read()))
+        assert np.array_equal(ph0, np.asarray(g.root().index("phase/~data").read()))
+    finally:
+        g.close()
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -24,7 +24,9 @@ import pygds
 
 from . import cclib
 from ._vcf import seqVCF2GDS, seqGDS2VCF
-from ._write import seqAddValue, seqDelete, seqRecompress
+from ._write import seqAddValue, seqDelete, seqRecompress, seqTranspose
+from ._snpbed import (seqBED2GDS, seqGDS2BED, seqSNP2GDS, seqGDS2SNP)
+from ._merge import seqMerge
 
 __version__ = "0.2.0"
 
@@ -74,6 +76,13 @@ def seqOpen(filename, readonly=True, allow_dup=False):
 
 def seqClose(f):
     """Close the underlying GDS file."""
+    # drop the engine's cached CFileInfo first: pygds recycles file-id integers,
+    # so a stale entry could otherwise be reused for the next (differently-sized)
+    # file and return the wrong variant count / selection.
+    try:
+        cclib.file_done(f.fileid)
+    except Exception:
+        pass
     f.gds.close()
 
 
@@ -456,4 +465,6 @@ __all__ = [
     "seqSummary", "seqExampleFileName",
     "seqNumAllele", "seqAlleleCount", "seqAlleleFreq", "seqMissing",
     "seqVCF2GDS", "seqGDS2VCF", "seqAddValue", "seqDelete", "seqRecompress",
+    "seqTranspose", "seqBED2GDS", "seqGDS2BED", "seqSNP2GDS", "seqGDS2SNP",
+    "seqMerge",
 ]
