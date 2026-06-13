@@ -2,7 +2,7 @@
 //
 // ReadByVariant.h: Read data variant by variant
 //
-// Copyright (C) 2017    Xiuwen Zheng
+// Copyright (C) 2013-2026    Xiuwen Zheng
 //
 // This file is part of PySeqArray.
 //
@@ -18,6 +18,10 @@
 // You should have received a copy of the GNU General Public License
 // along with PySeqArray.
 // If not, see <http://www.gnu.org/licenses/>.
+
+// Native (Python/NumPy) port of SeqArray's src/ReadByVariant.h. Each
+// CApply_Variant_* reader replaces R's SEXP-based NeedRData(int&)/ReadData(SEXP)
+// with NeedArray()/ReadData(PyObject*).
 
 #include "Index.h"
 
@@ -35,6 +39,7 @@ class COREARRAY_DLL_LOCAL CApply_Variant_Basic: public CApply_Variant
 {
 protected:
 	C_SVType SVType;
+	PyObject *VarNode;  ///< Python object
 public:
 	/// constructor
 	CApply_Variant_Basic(CFileInfo &File, const char *var_name);
@@ -48,7 +53,7 @@ class COREARRAY_DLL_LOCAL CApply_Variant_Pos: public CApply_Variant
 {
 protected:
 	int *PtrPos;
-	PyObject *VarNode;  ///< R object
+	PyObject *VarNode;  ///< Python object
 public:
 	/// constructor
 	CApply_Variant_Pos(CFileInfo &File);
@@ -62,7 +67,7 @@ class COREARRAY_DLL_LOCAL CApply_Variant_Chrom: public CApply_Variant
 {
 protected:
 	CChromIndex *ChromIndex;
-	PyObject *VarNode;  ///< R object
+	PyObject *VarNode;  ///< Python object
 public:
 	/// constructor
 	CApply_Variant_Chrom(CFileInfo &File);
@@ -80,9 +85,11 @@ protected:
 	CGenoIndex *GenoIndex;  ///< indexing genotypes
 	ssize_t SiteCount;  ///< the total number of entries at a site
 	ssize_t CellCount;  ///< the selected number of entries at a site
-	vector<C_BOOL> Selection;  ///< the buffer of selection
-	VEC_AUTO_PTR ExtPtr;       ///< a pointer to the additional buffer
-	PyObject *VarIntGeno;      ///< genotype R integer object
+	int UseRaw;  ///< whether use RAW type: FALSE, int; TRUE, raw; NA: auto
+	TSelection::TSampStruct *pSampSel;   ///< the structure for selected samples
+	VEC_AUTO_PTR ExtPtr;  ///< a pointer to the additional buffer
+	PyObject *VarIntGeno;    ///< genotype integer (NumPy) object
+	PyObject *VarRawGeno;    ///< genotype RAW (NumPy uint8) object
 
 	inline int _ReadGenoData(int *Base);
 	inline C_UInt8 _ReadGenoData(C_UInt8 *Base);
@@ -93,13 +100,13 @@ public:
 
 	/// constructor
 	CApply_Variant_Geno();
-	CApply_Variant_Geno(CFileInfo &File);
-	~CApply_Variant_Geno();
+	CApply_Variant_Geno(CFileInfo &File, int use_raw);
 
-	void Init(CFileInfo &File);
+	void Init(CFileInfo &File, int use_raw);
 
-	virtual PyObject *NeedArray();
 	virtual void ReadData(PyObject *val);
+	virtual PyObject *NeedArray();
+	bool NeedIntType();
 
 	/// read genotypes in 32-bit integer
 	void ReadGenoData(int *Base);
@@ -114,18 +121,30 @@ public:
 class COREARRAY_DLL_LOCAL CApply_Variant_Dosage: public CApply_Variant_Geno
 {
 protected:
+	PyObject *VarDosage;   ///< dosage (NumPy) object
 	VEC_AUTO_PTR ExtPtr2;  ///< a pointer to the additional buffer for dosages
+	bool IsAlt;            ///< if true, ReadData() returns the dosage of alternative alleles
+	bool IsAlt2;           ///< if IsAlt=true && IsAlt2==true, ReadData() returns
+	                       ///  the dosage of alternative alleles allowing partially missing
 public:
 	/// constructor
-	CApply_Variant_Dosage(CFileInfo &File);
+	CApply_Variant_Dosage(CFileInfo &File, int use_raw, bool alt, bool alt2);
 
-	virtual PyObject *NeedArray();
 	virtual void ReadData(PyObject *val);
+	virtual PyObject *NeedArray();
 
 	/// read dosages in 32-bit integer
 	void ReadDosage(int *Base);
+	/// read dosages of alternative alleles in 32-bit integer
+	void ReadDosageAlt(int *Base);
+	/// read dosages of alternative alleles in 32-bit integer, allowing partial missing
+	void ReadDosageAlt_p(int *Base);
 	/// read dosages in unsigned 8-bit intetger
 	void ReadDosage(C_UInt8 *Base);
+	/// read dosages of alternative alleles in unsigned 8-bit intetger
+	void ReadDosageAlt(C_UInt8 *Base);
+	/// read dosages of alternative alleles in unsigned 8-bit intetger, allowing partial missing
+	void ReadDosageAlt_p(C_UInt8 *Base);
 };
 
 
@@ -139,7 +158,7 @@ protected:
 	ssize_t CellCount;  ///< the selected number of entries at a site
 	bool UseRaw;  ///< whether use RAW type
 	vector<C_BOOL> Selection;  ///< the buffer of selection
-	PyObject *VarPhase;  ///< genotype R object
+	PyObject *VarPhase;  ///< phase (NumPy) object
 
 public:
 	ssize_t SampNum;  ///< the number of selected samples
@@ -210,23 +229,95 @@ class COREARRAY_DLL_LOCAL CApply_Variant_NumAllele: public CApply_Variant
 {
 private:
 	string strbuf;
+protected:
+	PyObject *VarNode;  ///< Python object
 public:
 	/// constructor
 	CApply_Variant_NumAllele(CFileInfo &File);
 
-	virtual PyObject *NeedArray();
 	virtual void ReadData(PyObject *val);
+	virtual PyObject *NeedArray();
 	int GetNumAllele();
 };
 
-}
 
-
-extern "C"
+/// Object for reading the reference allele variant by variant
+class COREARRAY_DLL_LOCAL CApply_Variant_RefAllele: public CApply_Variant
 {
+private:
+	string strbuf;
+protected:
+	PyObject *VarNode;  ///< Python object
+public:
+	/// constructor
+	CApply_Variant_RefAllele(CFileInfo &File);
 
-/// Apply functions over margins on a working space
-COREARRAY_DLL_EXPORT PyObject *SEQ_Apply_Variant(PyObject *gdsfile, PyObject *var_name,
-	PyObject *FUN, PyObject *as_is, PyObject *var_index, PyObject *param, PyObject *rho);
+	virtual void ReadData(PyObject *val);
+	virtual PyObject *NeedArray();
+};
 
-} // extern "C"
+
+/// Object for reading the alternative allele(s) variant by variant
+class COREARRAY_DLL_LOCAL CApply_Variant_AltAllele: public CApply_Variant
+{
+private:
+	string strbuf;
+protected:
+	PyObject *VarNode;  ///< Python object
+public:
+	/// constructor
+	CApply_Variant_AltAllele(CFileInfo &File);
+
+	virtual void ReadData(PyObject *val);
+	virtual PyObject *NeedArray();
+};
+
+
+/// Object for reading chromosome:position variant by variant
+class COREARRAY_DLL_LOCAL CApply_Variant_ChromPos: public CApply_Variant
+{
+protected:
+	CChromIndex *ChromIndex;
+	int *PtrPos;
+	PyObject *VarNode;  ///< Python object
+public:
+	/// constructor
+	CApply_Variant_ChromPos(CFileInfo &File);
+
+	virtual void ReadData(PyObject *val);
+	virtual PyObject *NeedArray();
+};
+
+
+/// Object for reading chromosome:position_allele variant by variant
+class COREARRAY_DLL_LOCAL CApply_Variant_ChromPosAllele: public CApply_Variant
+{
+private:
+	string strbuf;
+protected:
+	CChromIndex *ChromIndex;
+	int *PtrPos;
+	PyObject *VarNode;  ///< Python object
+public:
+	/// constructor
+	CApply_Variant_ChromPosAllele(CFileInfo &File);
+
+	virtual void ReadData(PyObject *val);
+	virtual PyObject *NeedArray();
+};
+
+
+/// Object for reading the 1-based variant index variant by variant
+class COREARRAY_DLL_LOCAL CApply_Variant_VariantIndex: public CApply_Variant
+{
+protected:
+	PyObject *VarNode;  ///< Python object
+public:
+	/// constructor
+	CApply_Variant_VariantIndex(CFileInfo &File);
+
+	virtual void ReadData(PyObject *val);
+	virtual PyObject *NeedArray();
+};
+
+}

@@ -2,28 +2,28 @@
 //
 // vectorization.h: compiler optimization with vectorization
 //
-// Copyright (C) 2016-2017    Xiuwen Zheng
+// Copyright (C) 2016-2024    Xiuwen Zheng
 //
-// This file is part of PySeqArray.
+// This file is part of SeqArray.
 //
-// PySeqArray is free software: you can redistribute it and/or modify it
+// SeqArray is free software: you can redistribute it and/or modify it
 // under the terms of the GNU General Public License Version 3 as
 // published by the Free Software Foundation.
 //
-// PySeqArray is distributed in the hope that it will be useful, but
+// SeqArray is distributed in the hope that it will be useful, but
 // WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public
-// License along with PySeqArray.
+// License along with SeqArray.
 // If not, see <http://www.gnu.org/licenses/>.
 
 /**
  *	\file     vectorization.h
  *	\author   Xiuwen Zheng [zhengx@u.washington.edu]
  *	\version  1.0
- *	\date     2016
+ *	\date     2016-2024
  *	\brief    compiler optimization with vectorization
  *	\details
 **/
@@ -32,10 +32,11 @@
 #ifndef _HEADER_COREARRAY_VECTORIZATION_
 #define _HEADER_COREARRAY_VECTORIZATION_
 
-#include "CoreDEF.h"
+#include <CoreDEF.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+
 
 #if defined(COREARRAY_SIMD_SSE) && defined(COREARRAY_SIMD_SSE2)
 
@@ -296,9 +297,6 @@ COREARRAY_DLL_DEFAULT const int8_t *vec_i8_cnt_nonzero_ptr(const int8_t *p,
 // functions for int8
 // ===========================================================
 
-/// return the pointer to the non-zeros character starting from p
-COREARRAY_DLL_DEFAULT const char *vec_i8_ptr_nonzero(const char *p, size_t n);
-
 /// count how many 'val' in 'p'
 COREARRAY_DLL_DEFAULT size_t vec_i8_count(const char *p, size_t n, char val);
 
@@ -315,10 +313,17 @@ COREARRAY_DLL_DEFAULT void vec_i8_count3(const char *p, size_t n,
 COREARRAY_DLL_DEFAULT void vec_i8_replace(int8_t *p, size_t n, int8_t val,
 	int8_t substitute);
 
-///
+/// output (p[0]==val) + (p[1]==val) or missing_substitute
 COREARRAY_DLL_DEFAULT void vec_i8_cnt_dosage2(const int8_t *p,
-	int8_t *out, size_t n, int8_t val, int8_t missing,
-	int8_t missing_substitute);
+	int8_t *out, size_t n, int8_t val, int8_t missing, int8_t missing_substitute);
+
+/// output (p[0]!=val) + (p[1]!=val) or missing_substitute
+COREARRAY_DLL_DEFAULT void vec_i8_cnt_dosage_alt2(const int8_t *p,
+	int8_t *out, size_t n, int8_t val, int8_t missing, int8_t missing_substitute);
+
+/// output (p[0]!=val) + (p[1]!=val) allowing partial missing
+COREARRAY_DLL_DEFAULT void vec_i8_cnt_dosage_alt2_p(const int8_t *p,
+	int8_t *out, size_t n, int8_t val, int8_t missing, int8_t missing_substitute);
 
 
 
@@ -328,6 +333,10 @@ COREARRAY_DLL_DEFAULT void vec_i8_cnt_dosage2(const int8_t *p,
 
 /// shifting *p right by 2 bits, assuming p is 2-byte aligned
 COREARRAY_DLL_DEFAULT void vec_u8_shr_b2(uint8_t *p, size_t n);
+
+/// *p |= (*s) << nbit
+COREARRAY_DLL_DEFAULT void vec_u8_or_shl(uint8_t *p, size_t n,
+	const uint8_t *s, const uint8_t nbit);
 
 
 
@@ -365,11 +374,29 @@ COREARRAY_DLL_DEFAULT void vec_i32_replace(int32_t *p, size_t n, int32_t val,
 
 /// assuming 'out' is 4-byte aligned, output (p[0]==val) + (p[1]==val) or missing_substitute
 COREARRAY_DLL_DEFAULT void vec_i32_cnt_dosage2(const int32_t *p,
-	int32_t *out, size_t n, int32_t val, int32_t missing,
-	int32_t missing_substitute);
+	int32_t *out, size_t n, int32_t val, int32_t missing, int32_t missing_substitute);
+
+/// assuming 'out' is 4-byte aligned, output (p[0]!=val) + (p[1]!=val) or missing_substitute
+COREARRAY_DLL_DEFAULT void vec_i32_cnt_dosage_alt2(const int32_t *p,
+	int32_t *out, size_t n, int32_t val, int32_t missing, int32_t missing_substitute);
+
+/// output (p[0]!=val) + (p[1]!=val) allowing partial missing
+COREARRAY_DLL_DEFAULT void vec_i32_cnt_dosage_alt2_p(const int32_t *p,
+	int32_t *out, size_t n, int32_t val, int32_t missing, int32_t missing_substitute);
 
 /// shifting *p right by 2 bits, assuming p is 4-byte aligned
 COREARRAY_DLL_DEFAULT void vec_i32_shr_b2(int32_t *p, size_t n);
+
+/// bounds checking, return 0 if fails
+COREARRAY_DLL_DEFAULT int vec_i32_bound_check(const int32_t *p, size_t n, int bound);
+
+/// *p |= (*s) << nbit
+COREARRAY_DLL_DEFAULT void vec_i32_or_shl(int32_t *p, size_t n,
+	const int32_t *s, const uint8_t nbit);
+
+/// *p |= (*s) << nbit
+COREARRAY_DLL_DEFAULT void vec_i32_or_shl2(int32_t *p, size_t n,
+	const uint8_t *s, const uint8_t nbit);
 
 
 
@@ -377,14 +404,23 @@ COREARRAY_DLL_DEFAULT void vec_i32_shr_b2(int32_t *p, size_t n);
 // functions for float64
 // ===========================================================
 
+/// get the number of finite numbers
+COREARRAY_DLL_DEFAULT size_t vec_f64_num_notfinite(const double p[], size_t n);
 
 
 // ===========================================================
-// functions for char
+// functions for searching characters
 // ===========================================================
 
+#define  VEC_BOOL_FIND_TRUE(p, end)    \
+	(C_BOOL*)vec_bool_find_true((int8_t*)(p), (int8_t*)(end))
+
+/// find CRLF character
 COREARRAY_DLL_DEFAULT const char *vec_char_find_CRLF(const char *p, size_t n);
 
+/// find non-zero
+COREARRAY_DLL_DEFAULT const int8_t *vec_bool_find_true(const int8_t *p,
+	const int8_t *end);
 
 
 #ifdef __cplusplus

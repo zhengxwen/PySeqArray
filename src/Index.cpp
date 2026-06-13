@@ -2,7 +2,7 @@
 //
 // Index.cpp: Indexing Objects
 //
-// Copyright (C) 2017    Xiuwen Zheng
+// Copyright (C) 2017-2026    Xiuwen Zheng
 //
 // This file is part of PySeqArray.
 //
@@ -19,8 +19,33 @@
 // along with PySeqArray.
 // If not, see <http://www.gnu.org/licenses/>.
 
+// ---------------------------------------------------------------------------
+// Native (Python/NumPy) port of the current SeqArray src/Index.cpp. The R
+// SEXP/Rinternals layer is replaced by CPython + NumPy via pygds. Notes on the
+// few non-mechanical adaptations vs. the R source:
+//   * R warnings -> fprintf(stderr, ...)
+//   * Rconnection-based CProgress -> FILE*/stdout CProgressStdOut
+//   * GDS_Node_Load/Unload (absent from pygds) -> GDS_Node_Path (file owns it)
+//   * the R multi-process progress globals (R_Process_*) are dropped; parallel
+//     execution is handled by the Python layer (os.fork)
+//   * RObject_GDS / RAppendGDS allocate / append NumPy arrays instead of SEXP
+// ---------------------------------------------------------------------------
+
+#include <cstdio>
 #include "Index.h"
 #include <numpy/arrayobject.h>
+
+// ---------------------------------------------------------------------------
+// NumPy 1.x -> 2.x compatibility shim (see note in the original port): the
+// macros shadow the strict inline functions and insert the PyArrayObject* cast.
+#ifndef NUMPY_IMPORT_ARRAY_RETVAL
+#  define NUMPY_IMPORT_ARRAY_RETVAL  NULL
+#endif
+#define PyArray_DATA(o)        PyArray_DATA((PyArrayObject*)(o))
+#define PyArray_NDIM(o)        PyArray_NDIM((PyArrayObject*)(o))
+#define PyArray_DIMS(o)        PyArray_DIMS((PyArrayObject*)(o))
+#define PyArray_TYPE(o)        PyArray_TYPE((PyArrayObject*)(o))
+#define PyArray_SETITEM(o,p,v) PyArray_SETITEM((PyArrayObject*)(o),(char*)(p),(v))
 
 using namespace std;
 
@@ -30,19 +55,24 @@ namespace PySeqArray
 
 static double NaN = 0.0/0.0;
 
+static const char *ERR_INDEX_VALUE =
+	"Warning: '%s' should not contain negative values or NA (replaced by zero).\n";
+
+
 // ===========================================================
 // Indexing object
 // ===========================================================
 
 CIndex::CIndex()
 {
-	TotalLength = 0;
-	Position = 0;
+	TotalLength = Position = 0;
 	AccSum = 0;
 	AccIndex = AccOffset = 0;
+	has_index = false;
+	val_max = 0;
 }
 
-void CIndex::Init(PdContainer Obj)
+void CIndex::Init(PdContainer Obj, const char *varname)
 {
 	Values.clear();
 	Lengths.clear();
@@ -56,6 +86,7 @@ void CIndex::Init(PdContainer Obj)
 	TotalLength = n;
 	int last = -1;
 	C_UInt32 repeat = 0;
+	bool if_neg_val = false;
 
 	while (n > 0)
 	{
@@ -65,7 +96,7 @@ void CIndex::Init(PdContainer Obj)
 		for (int *p = Buffer; m > 0; m--)
 		{
 			int v = *p++;
-			if (v < 0) v = 0;
+			if (v < 0) { v = 0; if_neg_val = true; }
 			if (v == last)
 			{
 				repeat ++;
@@ -73,22 +104,28 @@ void CIndex::Init(PdContainer Obj)
 				if (repeat > 0)
 				{
 					Values.push_back(last);
-					Lengths.push_back(repeat);					
+					Lengths.push_back(repeat);
 				}
 				last = v; repeat = 1;
 			}
 		}
 	}
-
 	if (repeat > 0)
 	{
 		Values.push_back(last);
-		Lengths.push_back(repeat);					
+		Lengths.push_back(repeat);
 	}
 
 	Position = 0;
 	AccSum = 0;
 	AccIndex = AccOffset = 0;
+	has_index = true;
+	val_max = 0;
+	for (size_t i=0; i < Values.size(); i++)
+		if (Values[i] > val_max) val_max = Values[i];
+
+	if (if_neg_val && varname)
+		fprintf(stderr, ERR_INDEX_VALUE, varname);
 }
 
 void CIndex::InitOne(int num)
@@ -101,6 +138,8 @@ void CIndex::InitOne(int num)
 	Position = 0;
 	AccSum = 0;
 	AccIndex = AccOffset = 0;
+	has_index = false;
+	val_max = 1;
 }
 
 void CIndex::GetInfo(size_t pos, C_Int64 &Sum, int &Value)
@@ -137,9 +176,7 @@ PyObject* CIndex::GetLen_Sel(const C_BOOL sel[])
 	size_t n;
 	const C_BOOL *p = (C_BOOL *)vec_i8_cnt_nonzero_ptr((const int8_t *)sel,
 		TotalLength, &n);
-	// create a numpy array object
-	npy_intp dims[1] = { (npy_intp)n };
-	PyObject *ans = PyArray_SimpleNew(1, dims, NPY_INT32);
+	PyObject *ans = numpy_new_int32(n);
 	if (n > 0)
 	{
 		int *pV = &Values[0];
@@ -161,7 +198,7 @@ PyObject* CIndex::GetLen_Sel(const C_BOOL sel[])
 			}
 		}
 		// get lengths
-		int *pAns = (int*)PyArray_DATA(ans);
+		int *pAns = (int*)numpy_getptr(ans);
 		while (n > 0)
 		{
 			if (L == 0)
@@ -186,9 +223,7 @@ PyObject* CIndex::GetLen_Sel(const C_BOOL sel[], int &out_var_start,
 	size_t n;
 	const C_BOOL *p = (C_BOOL *)vec_i8_cnt_nonzero_ptr((const int8_t *)sel,
 		TotalLength, &n);
-	// create a numpy array object
-	npy_intp dims[1] = { (npy_intp)n };
-	PyObject *ans = PyArray_SimpleNew(1, dims, NPY_INT32);
+	PyObject *ans = numpy_new_int32(n);
 	out_var_start = 0;
 	out_var_count = 0;
 
@@ -217,7 +252,7 @@ PyObject* CIndex::GetLen_Sel(const C_BOOL sel[], int &out_var_start,
 		int *pVV = pV;
 		C_UInt32 *pLL = pL;
 		size_t LL = L;
-		int *pAns = (int*)PyArray_DATA(ans);
+		int *pAns = (int*)numpy_getptr(ans);
 		for (size_t m=n; m > 0; )
 		{
 			if (L == 0)
@@ -271,7 +306,7 @@ CGenoIndex::CGenoIndex()
 	AccIndex = AccOffset = 0;
 }
 
-void CGenoIndex::Init(PdContainer Obj)
+void CGenoIndex::Init(PdContainer Obj, const char *varname)
 {
 	Values.clear();
 	Lengths.clear();
@@ -294,7 +329,6 @@ void CGenoIndex::Init(PdContainer Obj)
 		for (C_UInt16 *p = Buffer; m > 0; m--)
 		{
 			C_UInt16 v = *p++;
-			if (v < 0) v = 0;
 			if (v == last)
 			{
 				repeat ++;
@@ -302,7 +336,7 @@ void CGenoIndex::Init(PdContainer Obj)
 				if (repeat > 0)
 				{
 					Values.push_back(last);
-					Lengths.push_back(repeat);					
+					Lengths.push_back(repeat);
 				}
 				last = v; repeat = 1;
 			}
@@ -312,7 +346,7 @@ void CGenoIndex::Init(PdContainer Obj)
 	if (repeat > 0)
 	{
 		Values.push_back(last);
-		Lengths.push_back(repeat);					
+		Lengths.push_back(repeat);
 	}
 
 	Position = 0;
@@ -359,6 +393,11 @@ CChromIndex::CChromIndex() { }
 
 void CChromIndex::AddChrom(PdGDSFolder Root)
 {
+	static const char *WARN_MSG =
+		"@chrom_rle_val and @chrom_rle_len are not correct, "
+		"please call 'seqOptimize(..., target='chromosome') to update "
+		"the chromosome indexing.";
+
 	PdAbstractArray varVariant = GDS_Node_Path(Root, "variant.id", TRUE);
 	C_Int32 NumVariant = GDS_Array_GetTotalCount(varVariant);
 
@@ -369,18 +408,59 @@ void CChromIndex::AddChrom(PdGDSFolder Root)
 		throw ErrSeqArray("Invalid dimension of 'chromosome'.");
 	if (NumChrom <= 0) return;
 
+	// initialize Map and RleChr
+	Map.clear();
+	RleChr.Clear();
+
+	// check whether RLE representation of chromosome is stored
+	PdAbstractArray rle_val = GDS_Node_Path(Root, "@chrom_rle_val", FALSE);
+	PdAbstractArray rle_len = GDS_Node_Path(Root, "@chrom_rle_len", FALSE);
+	if (rle_val && rle_len)
+	{
+		C_Int32 n1 = GDS_Array_GetTotalCount(rle_val);
+		C_Int32 n2 = GDS_Array_GetTotalCount(rle_len);
+		if (GDS_Array_DimCnt(rle_val)==1 && GDS_Array_DimCnt(rle_len)==1 &&
+			(n1 == n2))
+		{
+			vector<string> val(n1);
+			vector<C_Int32> len(n1);
+			C_Int32 idx = 0;
+			GDS_Array_ReadData(rle_val, &idx, &n1, &val[0], svStrUTF8);
+			GDS_Array_ReadData(rle_len, &idx, &n1, &len[0], svInt32);
+
+			int ntot = 0;
+			for (int i=0; i < n1; i++) ntot += len[i];
+			if (ntot == NumVariant)
+			{
+				TRange rng;
+				rng.Start = 0;
+				for (int i=0; i < n1; i++)
+				{
+					rng.Length = len[i];
+					Map[val[i]].push_back(rng);
+					rng.Start += rng.Length;
+					RleChr.Add(val[i], len[i]);
+				}
+				RleChr.Init();
+				return;
+			} else
+				throw ErrSeqArray(WARN_MSG);
+		} else {
+			throw ErrSeqArray(WARN_MSG);
+		}
+	} else if (rle_val || rle_len)
+	{
+		throw ErrSeqArray(WARN_MSG);
+	}
+
+	// no stored RLE representation
 	C_Int32 idx=0, len=1;
 	string last;
 	GDS_Array_ReadData(varChrom, &idx, &len, &last, svStrUTF8);
 	idx ++;
 
 	TRange rng;
-	rng.Start = 0;
-	rng.Length = 1;
-
-	Map.clear();
-	PosToChr.Clear();
-
+	rng.Start = 0; rng.Length = 1;
 	const C_Int32 NMAX = 4096;
 	string txt[NMAX];
 
@@ -396,7 +476,7 @@ void CChromIndex::AddChrom(PdGDSFolder Root)
 				rng.Length ++;
 			} else {
 				Map[last].push_back(rng);
-				PosToChr.Add(last, rng.Length);
+				RleChr.Add(last, rng.Length);
 				last = string(txt[i].begin(), txt[i].end());
 				rng.Start = idx + i;
 				rng.Length = 1;
@@ -406,8 +486,8 @@ void CChromIndex::AddChrom(PdGDSFolder Root)
 	}
 
 	Map[last].push_back(rng);
-	PosToChr.Add(last, rng.Length);
-	PosToChr.Init();
+	RleChr.Add(last, rng.Length);
+	RleChr.Init();
 }
 
 void CChromIndex::Clear()
@@ -469,8 +549,18 @@ bool CRangeSet::IsIncluded(int point)
 {
 	TRange rng;
 	rng.Start = rng.End = point;
-	set<TRange, less_range>::iterator it = _RangeSet.find(rng);
-	return it != _RangeSet.end();
+	set<TRange, less_range>::iterator p = _RangeSet.find(rng);
+	return (p != _RangeSet.end()) && (p->Start <= point) && (point <= p->End);
+}
+
+void CRangeSet::GetRanges(int Start[], int End[])
+{
+	set<TRange, less_range>::const_iterator it = _RangeSet.begin();
+	for (size_t n=_RangeSet.size(); n > 0; n--, it++)
+	{
+		*Start++ = it->Start;
+		*End++   = it->End;
+	}
 }
 
 
@@ -482,10 +572,246 @@ bool CRangeSet::IsIncluded(int point)
 static const char *ERR_DIM = "Invalid dimension of '%s'.";
 static const char *ERR_FILE_ROOT = "CFileInfo::FileRoot should be initialized.";
 
+TSelection::TSelection(CFileInfo &File, bool init)
+{
+	Link = NULL;
+	if (File.Ploidy() <= 0)
+		throw ErrSeqArray("Unable to determine ploidy.");
+	numPloidy = File.Ploidy();
+	numSamp = File.SampleNum(); pSample = new C_BOOL[numSamp];
+	if (init) memset(pSample, TRUE, numSamp);
+	numVar = File.VariantNum(); pVariant = new C_BOOL[numVar];
+	if (init) memset(pVariant, TRUE, numVar);
+	pFlagGenoSel = NULL;
+	varTrueNum = -1; varStart = varEnd = 0;
+}
+
+TSelection::~TSelection()
+{
+	if (pSample)
+		{ delete[] pSample; pSample = NULL; }
+	if (pVariant)
+		{ delete[] pVariant; pVariant = NULL; }
+	ClearStructSample();
+	Link = NULL;
+}
+
+TSelection::TSampStruct *TSelection::GetStructSample()
+{
+	// the block size considered in the block reading
+	static ptrdiff_t block_size = 512;
+
+	if (!pFlagGenoSel)
+	{
+		const size_t SIZE = numSamp * numPloidy;
+		pFlagGenoSel = new C_BOOL[SIZE];  // set the output
+		C_BOOL *p = pFlagGenoSel, *s = pSample;
+		memset(p, TRUE, SIZE);
+		for (size_t n=numSamp; n > 0; n--)
+		{
+			if (*s++ == FALSE)
+			{
+				for (size_t m=numPloidy; m > 0; m--) *p++ = FALSE;
+			} else {
+				p += numPloidy;
+			}
+		}
+	}
+
+	if (pSampList.empty())
+	{
+		TSampStruct ss, last;
+		last.length = last.offset = 0; last.sel = NULL;
+		C_BOOL *pSt = pSample, *pEnd = pSample + numSamp;
+		// find the first TRUE
+		while (pSt<pEnd && !*pSt) pSt++;
+		// for-loop all TRUE blocks
+		for (; pSt < pEnd; )
+		{
+			// find the last TRUE of the TRUE block
+			C_BOOL *pE = pSt;
+			while (pE<pEnd && *pE) pE++;
+			// find the first TRUE of the next TRUE block
+			C_BOOL *pSt2 = pE;
+			while (pSt2<pEnd && !*pSt2) pSt2++;
+			//
+			if (pE-pSt >= block_size)
+			{
+				// TRUE block: long enough
+				if (last.length > 0)
+				{
+					pSampList.push_back(last);
+					last.length = 0;
+				}
+				ss.length = (pE - pSt) * numPloidy;
+				ss.offset = (pSt - pSample) * numPloidy;
+				ss.sel = NULL;
+				pSampList.push_back(ss);
+			} else if (pSt2-pE >= block_size)
+			{
+				// TRUE block: short, but far away from the next TRUE block
+				if (last.length > 0)
+				{
+					// merge with the last block
+					last.length = (pE - pSample) * numPloidy - last.offset;
+					if (!last.sel)
+						last.sel = pFlagGenoSel + last.offset;
+					pSampList.push_back(last);
+					last.length = 0;
+				} else {
+					ss.length = (pE - pSt) * numPloidy;
+					ss.offset = (pSt - pSample) * numPloidy;
+					ss.sel = NULL;
+					pSampList.push_back(ss);
+				}
+			} else {
+				// sparse
+				if (last.length > 0)
+				{
+					// merge with the last block
+					last.length = (pE - pSample) * numPloidy - last.offset;
+					if (!last.sel)
+						last.sel = pFlagGenoSel + last.offset;
+				} else {
+					last.length = (pE - pSt) * numPloidy;
+					last.offset = (pSt - pSample) * numPloidy;
+					last.sel = NULL;
+				}
+			}
+			// at last
+			pSt = pSt2;
+		}
+
+		// the ending one
+		if (last.length > 0)
+			pSampList.push_back(last);
+		ss.length = ss.offset = 0; ss.sel = NULL;
+		pSampList.push_back(ss);
+	}
+
+	{
+		// check
+		ssize_t num = 0;
+		TSampStruct *p = &pSampList[0];
+		for (; p->length > 0; p++)
+		{
+			if (p->sel)
+				num += GetNumOfTRUE(p->sel, p->length);
+			else
+				num += p->length;
+		}
+		ssize_t num_samp = GetNumOfTRUE(pSample, numSamp);
+		if (num_samp*ssize_t(numPloidy) != num)
+			throw ErrSeqArray("Internal error when preparing structure for selected samples.");
+	}
+
+	return &pSampList[0];
+}
+
+void TSelection::ClearStructSample()
+{
+	if (pFlagGenoSel)
+	{
+		delete[] pFlagGenoSel;
+		pFlagGenoSel = NULL;
+	}
+	pSampList.clear();
+}
+
+void TSelection::GetStructVariant()
+{
+	if (varTrueNum < 0)
+	{
+		C_BOOL *end = pVariant + numVar;
+		C_BOOL *p = VEC_BOOL_FIND_TRUE(pVariant, end);
+		varStart = p - pVariant;
+		C_BOOL *last = end - 1;
+		size_t num = 0;
+		for (; p < end; p++)
+			if (*p) { num++; last = p; }
+		varTrueNum = num;
+		varEnd = last + 1 - pVariant;
+	}
+}
+
+void TSelection::ClearSelectVariant()
+{
+	if (varTrueNum < 0)
+	{
+		memset(pVariant, 0, numVar);
+	} else {
+		memset(pVariant+varStart, 0, varEnd-varStart);
+	}
+	varTrueNum = varStart = varEnd = 0;
+}
+
+void TSelection::ClearStructVariant()
+{
+	varTrueNum = -1;
+	varStart = varEnd = 0;
+}
+
+
+// TVarMap
+
+TVarMap::TVarMap()
+{
+	Obj = NULL; ObjID = 0;
+	NDim = 0;
+	memset(Dim, 0, sizeof(Dim));
+	Func = NULL;
+	IsBit1 = false;
+}
+
+void TVarMap::Init(CFileInfo &file, const string &varnm, TFunction fc)
+{
+	Name = varnm;
+	get_obj(file, varnm);
+	NDim = GDS_Array_DimCnt(Obj);
+	if (NDim > 4)
+		throw ErrSeqArray(ERR_DIM, varnm.c_str());
+	GDS_Array_GetDim(Obj, Dim, 4);
+	Func = fc;
+}
+
+void TVarMap::InitWtIndex(CFileInfo &file, const string &varnm, TFunction fc)
+{
+	Name = varnm;
+	get_obj(file, varnm);
+	NDim = GDS_Array_DimCnt(Obj);
+	if (NDim > 4)
+		throw ErrSeqArray(ERR_DIM, varnm.c_str());
+	GDS_Array_GetDim(Obj, Dim, 4);
+	Func = fc;
+	// indexing if possible
+	string idx_name = GDS_PATH_PREFIX(varnm, '@');
+	PdAbstractArray N = file.GetObj(idx_name.c_str(), FALSE);
+	if (N)
+		Index.Init(N, idx_name.c_str());
+	else
+		Index.InitOne(file._VariantNum);
+}
+
+void TVarMap::get_obj(CFileInfo &file, const string &varnm)
+{
+	// pygds has no GDS_Node_Load; the node is owned by the file tree
+	Obj = GDS_Node_Path(file._Root, varnm.c_str(), TRUE);
+	ObjID = 0;
+	// set IsBit1
+	char classname[32] = { 0 };
+	GDS_Node_GetClassName(Obj, classname, sizeof(classname));
+	IsBit1 = (strcmp(classname, "dBit1") == 0);
+}
+
+
+// CFileInfo
+
 CFileInfo::CFileInfo(PdGDSFolder root)
 {
 	_Root = NULL;
+	_SelList = NULL;
 	_SampleNum = _VariantNum = 0;
+	_Ploidy = 0;
 	ResetRoot(root);
 }
 
@@ -493,6 +819,18 @@ CFileInfo::~CFileInfo()
 {
 	_Root = NULL;
 	_SampleNum = _VariantNum = 0;
+	clear_selection();
+}
+
+void CFileInfo::clear_selection()
+{
+	for (TSelection *p=_SelList; p != NULL; )
+	{
+		TSelection *n = p;
+		p = p->Link;
+		delete n;
+	}
+	_SelList = NULL;
 }
 
 void CFileInfo::ResetRoot(PdGDSFolder root)
@@ -501,9 +839,13 @@ void CFileInfo::ResetRoot(PdGDSFolder root)
 	{
 		// initialize
 		_Root = root;
-		SelList.clear();
 		_Chrom.Clear();
 		_Position.clear();
+		_GenoIndex = CGenoIndex();
+		_VarMap.clear();
+		clear_selection();
+
+		if (root == NULL) return;
 
 		// sample.id
 		PdAbstractArray Node = GDS_Node_Path(root, "sample.id", TRUE);
@@ -530,7 +872,11 @@ void CFileInfo::ResetRoot(PdGDSFolder root)
 				GDS_Array_GetDim(Node, DLen, 3);
 				_Ploidy = DLen[2];
 			}
-		}
+		} else
+			_Ploidy = 2;
+
+		// initialize selection
+		_SelList = new TSelection(*this, true);
 	}
 }
 
@@ -538,16 +884,28 @@ TSelection &CFileInfo::Selection()
 {
 	if (!_Root)
 		throw ErrSeqArray(ERR_FILE_ROOT);
-	if (SelList.empty())
-		SelList.push_back(TSelection());
+	return *_SelList;
+}
 
-	TSelection &s = SelList.back();
-	if (s.Sample.empty())
-		s.Sample.resize(_SampleNum, TRUE);
-	if (s.Variant.empty())
-		s.Variant.resize(_VariantNum, TRUE);
+TSelection &CFileInfo::Push_Selection(bool init_samp, bool init_var)
+{
+	TSelection *n = new TSelection(*this, false);
+	n->Link = _SelList;
+	if (init_samp)
+		memcpy(n->pSample, _SelList->pSample, _SampleNum);
+	if (init_var)
+		memcpy(n->pVariant, _SelList->pVariant, _VariantNum);
+	_SelList = n;
+	return *n;
+}
 
-	return s;
+void CFileInfo::Pop_Selection()
+{
+	if (_SelList==NULL || _SelList->Link==NULL)
+		throw ErrSeqArray("No filter can be pop up.");
+	TSelection *n = _SelList;
+	_SelList = n->Link;
+	delete n;
 }
 
 CChromIndex &CFileInfo::Chromosome()
@@ -557,6 +915,13 @@ CChromIndex &CFileInfo::Chromosome()
 	if (_Chrom.Empty())
 		_Chrom.AddChrom(_Root);
 	return _Chrom;
+}
+
+void CFileInfo::ResetChromosome()
+{
+	if (!_Root)
+		throw ErrSeqArray(ERR_FILE_ROOT);
+	_Chrom.Clear();
 }
 
 vector<C_Int32> &CFileInfo::Position()
@@ -577,28 +942,23 @@ vector<C_Int32> &CFileInfo::Position()
 	return _Position;
 }
 
+void CFileInfo::ClearPosition()
+{
+	if (!_Root)
+		throw ErrSeqArray(ERR_FILE_ROOT);
+	_Position.clear();
+	std::vector<C_Int32>().swap(_Position);
+}
+
 CGenoIndex &CFileInfo::GenoIndex()
 {
 	if (_GenoIndex.Empty())
 	{
-		PdAbstractArray I = GetObj("genotype/@data", TRUE);
-		_GenoIndex.Init(I);
+		const char *varname = "genotype/@data";
+		PdAbstractArray N = GDS_Node_Path(_Root, varname, TRUE);
+		_GenoIndex.Init(N, varname);
 	}
 	return _GenoIndex;
-}
-
-CIndex &CFileInfo::VarIndex(const string &varname)
-{
-	CIndex &I = _VarIndex[varname];
-	if (I.Empty())
-	{
-		PdAbstractArray N = GDS_Node_Path(_Root, varname.c_str(), FALSE);
-		if (N == NULL)
-			I.InitOne(_VariantNum);
-		else
-			I.Init(N);
-	}
-	return I;
 }
 
 PdAbstractArray CFileInfo::GetObj(const char *name, C_BOOL MustExist)
@@ -610,14 +970,15 @@ PdAbstractArray CFileInfo::GetObj(const char *name, C_BOOL MustExist)
 
 int CFileInfo::SampleSelNum()
 {
-	TSelection &sel = Selection();
-	return vec_i8_cnt_nonzero((C_Int8*)&sel.Sample[0], _SampleNum);
+	TSelection &s = Selection();
+	return vec_i8_cnt_nonzero((C_Int8*)s.pSample, _SampleNum);
 }
 
 int CFileInfo::VariantSelNum()
 {
-	TSelection &sel = Selection();
-	return vec_i8_cnt_nonzero((C_Int8*)&sel.Variant[0], _VariantNum);
+	TSelection &s = Selection();
+	s.GetStructVariant();
+	return s.varTrueNum;
 }
 
 
@@ -646,6 +1007,18 @@ COREARRAY_DLL_LOCAL CFileInfo &GetFileInfo(int file_id)
 	return p->second;
 }
 
+/// get TVarMap from a variable name (with possible indexing)
+COREARRAY_DLL_LOCAL TVarMap &VarGetStruct(CFileInfo &File, const string &name)
+{
+	map<string, TVarMap> &VM = File.VarMap();
+	map<string, TVarMap>::iterator it = VM.find(name);
+	if (it != VM.end())
+		return it->second;
+	TVarMap &v = VM[name];
+	v.InitWtIndex(File, name, NULL);
+	return v;
+}
+
 
 
 // ===========================================================
@@ -662,7 +1035,7 @@ static C_BOOL ArrayTRUEs[64] = {
 CVarApply::CVarApply()
 {
 	fVarType = ctNone;
-	MarginalSize = 0;
+	MarginalStart = MarginalEnd = 0;
 	MarginalSelect = NULL;
 	Node = NULL;
 	Position = 0;
@@ -673,20 +1046,16 @@ CVarApply::~CVarApply()
 
 void CVarApply::Reset()
 {
-	Position = 0;
-	if (MarginalSize > 0)
-		if (!MarginalSelect[0]) Next();
+	Position = MarginalStart;
+	if ((MarginalEnd - MarginalStart) > 0)
+		if (!MarginalSelect[MarginalStart]) Next();
 }
 
 bool CVarApply::Next()
 {
-	C_BOOL *p = MarginalSelect + Position;
-	while (Position < MarginalSize)
-	{
-		Position ++;
-		if (*(++p)) break;
-	}
-	return (Position < MarginalSize);
+	const C_BOOL *p = MarginalSelect;
+	Position = VEC_BOOL_FIND_TRUE(p+Position+1, p+MarginalEnd) - p;
+	return (Position < MarginalEnd);
 }
 
 C_BOOL *CVarApply::NeedTRUEs(size_t size)
@@ -703,20 +1072,20 @@ C_BOOL *CVarApply::NeedTRUEs(size_t size)
 
 
 CApply_Variant::CApply_Variant(): CVarApply()
-{
-	VarNode = NULL;
-}
+{ }
 
 CApply_Variant::CApply_Variant(CFileInfo &File): CVarApply()
 {
-	MarginalSize = File.VariantNum();
-	MarginalSelect = File.Selection().pVariant();
-	VarNode = NULL;
+	InitMarginal(File);
 }
 
-CApply_Variant::~CApply_Variant()
+void CApply_Variant::InitMarginal(CFileInfo &File)
 {
-	if (VarNode) Py_DECREF(VarNode);
+	TSelection &Sel = File.Selection();
+	Sel.GetStructVariant();
+	MarginalStart = Sel.varStart;
+	MarginalEnd = Sel.varEnd;
+	MarginalSelect = Sel.pVariant;
 }
 
 
@@ -744,7 +1113,7 @@ bool CVarApplyList::CallNext()
 
 
 // ===========================================================
-// Progress object
+// Progress object (stdout / FILE* based; no R connection)
 // ===========================================================
 
 static const int PROGRESS_BAR_CHAR_NUM = 50;
@@ -755,21 +1124,21 @@ static const double S_HOUR =  60 * S_MIN;
 static const double S_DAY  =  24 * S_HOUR;
 static const double S_YEAR = 365 * S_DAY;
 
-static const char *time_str(double s)
+COREARRAY_DLL_LOCAL const char *time_str(double s)
 {
 	if (GDS_Mach_Finite(s))
 	{
 		static char buffer[64];
 		if (s < S_MIN)
-			sprintf(buffer, "%.0fs", s);
+			snprintf(buffer, sizeof(buffer), "%.0fs", s);
 		else if (s < S_HOUR)
-			sprintf(buffer, "%.1fm", s/S_MIN);
+			snprintf(buffer, sizeof(buffer), "%.1fm", s/S_MIN);
 		else if (s < S_DAY)
-			sprintf(buffer, "%.1fh", s/S_HOUR);
+			snprintf(buffer, sizeof(buffer), "%.1fh", s/S_HOUR);
 		else if (s < S_YEAR)
-			sprintf(buffer, "%.1fd", s/S_DAY);
+			snprintf(buffer, sizeof(buffer), "%.1fd", s/S_DAY);
 		else
-			sprintf(buffer, "%.1f years", s/S_YEAR);
+			snprintf(buffer, sizeof(buffer), "%.1f years", s/S_YEAR);
 		return buffer;
 	} else
 		return "---";
@@ -778,8 +1147,8 @@ static const char *time_str(double s)
 
 CProgress::CProgress(C_Int64 start, C_Int64 count, FILE *conn, bool newline)
 {
-	TotalCount = count;
-	Counter = (start >= 0) ? start : 0;
+	fTotalCount = count;
+	fCounter = (start >= 0) ? start : 0;
 	double percent;
 	File = conn;
 	NewLine = newline;
@@ -791,8 +1160,8 @@ CProgress::CProgress(C_Int64 start, C_Int64 count, FILE *conn, bool newline)
 		if (n < 1) n = 1;
 		_start = _step = (double)count / n;
 		_hit = (C_Int64)(_start);
-		if (Counter > count) Counter = count;
-		percent = (double)Counter / count;
+		if (fCounter > count) fCounter = count;
+		percent = (double)fCounter / count;
 	} else {
 		_start = _step = 0;
 		_hit = PROGRESS_LINE_NUM;
@@ -810,18 +1179,23 @@ CProgress::CProgress(C_Int64 start, C_Int64 count, FILE *conn, bool newline)
 CProgress::~CProgress()
 { }
 
-void CProgress::Forward()
+void CProgress::Forward(C_Int64 Inc)
 {
-	Counter ++;
-	if (Counter >= _hit)
+	fCounter += Inc;
+	if (fTotalCount > 0 && fCounter > fTotalCount)
+		fCounter = fTotalCount;
+	if (fCounter >= _hit)
 	{
-		if (TotalCount > 0)
+		if (fTotalCount > 0)
 		{
-			_start += _step;
-			_hit = (C_Int64)(_start);
-			if (_hit > TotalCount) _hit = TotalCount;
+			while (_hit <= fCounter)
+			{
+				_start += _step;
+				_hit = (C_Int64)(_start);
+			}
+			if (_hit > fTotalCount) _hit = fTotalCount;
 		} else {
-			_hit += PROGRESS_LINE_NUM;
+			while (_hit <= fCounter) _hit += PROGRESS_LINE_NUM;
 		}
 		ShowProgress();
 	}
@@ -831,14 +1205,14 @@ void CProgress::ShowProgress()
 {
 	if (File)
 	{
-		if (TotalCount > 0)
+		if (fTotalCount > 0)
 		{
 			char bar[PROGRESS_BAR_CHAR_NUM + 1];
-			double p = (double)Counter / TotalCount;
+			double p = (double)fCounter / fTotalCount;
 			int n = (int)round(p * PROGRESS_BAR_CHAR_NUM);
 			memset(bar, '.', sizeof(bar));
 			memset(bar, '=', n);
-			if ((Counter > 0) && (n < PROGRESS_BAR_CHAR_NUM))
+			if ((fCounter > 0) && (n < PROGRESS_BAR_CHAR_NUM))
 				bar[n] = '>';
 			bar[PROGRESS_BAR_CHAR_NUM] = 0;
 
@@ -863,20 +1237,22 @@ void CProgress::ShowProgress()
 				fprintf(File, "[%s] %2.0f%%, ETC: %s\n", bar, p, time_str(s));
 			} else {
 				fprintf(File, "\r[%s] %2.0f%%, ETC: %s    ", bar, p, time_str(s));
-				if (Counter >= TotalCount) fprintf(File, "\n");
+				if (fCounter >= fTotalCount) fprintf(File, "\n");
 			}
 		} else {
-			int n = Counter / PROGRESS_LINE_NUM;
+			int n = fCounter / PROGRESS_LINE_NUM;
 			string s(n, '.');
 			if (NewLine)
 			{
-				if (Counter > 0)
-					fprintf(File, "[:%s (%lldk lines)]\n", s.c_str(), Counter/1000);
+				if (fCounter > 0)
+					fprintf(File, "[:%s (%lldk lines)]\n", s.c_str(),
+						(long long)(fCounter/1000));
 				else
 					fprintf(File, "[: (0 line)]\n");
 			} else {
-				if (Counter > 0)
-					fprintf(File, "\r[:%s (%lldk lines)]", s.c_str(), Counter/1000);
+				if (fCounter > 0)
+					fprintf(File, "\r[:%s (%lldk lines)]", s.c_str(),
+						(long long)(fCounter/1000));
 				else
 					fprintf(File, "\r[: (0 line)]");
 			}
@@ -898,14 +1274,14 @@ CProgressStdOut::CProgressStdOut(C_Int64 count, bool verbose):
 
 void CProgressStdOut::ShowProgress()
 {
-	if (Verbose && (TotalCount > 0))
+	if (Verbose && (fTotalCount > 0))
 	{
 		char bar[PROGRESS_BAR_CHAR_NUM + 1];
-		double p = (double)Counter / TotalCount;
+		double p = (double)fCounter / fTotalCount;
 		int n = (int)round(p * PROGRESS_BAR_CHAR_NUM);
 		memset(bar, '.', sizeof(bar));
 		memset(bar, '=', n);
-		if ((Counter > 0) && (n < PROGRESS_BAR_CHAR_NUM))
+		if ((fCounter > 0) && (n < PROGRESS_BAR_CHAR_NUM))
 			bar[n] = '>';
 		bar[PROGRESS_BAR_CHAR_NUM] = 0;
 
@@ -926,11 +1302,11 @@ void CProgressStdOut::ShowProgress()
 		p *= 100;
 
 		// show
-		if (Counter >= TotalCount)
+		if (fCounter >= fTotalCount)
 		{
 			s = difftime(_last_time, _start_time);
 			printf("\r[%s] 100%%, completed in %s\n", bar, time_str(s));
-		} else if ((interval >= 5) || (Counter <= 0))
+		} else if ((interval >= 5) || (fCounter <= 0))
 		{
 			_last_time = now;
 			printf("\r[%s] %2.0f%%, ETC: %s    ", bar, p, time_str(s));
@@ -946,6 +1322,97 @@ void CProgressStdOut::ShowProgress()
 
 // the buffer of ArrayTRUEs
 static vector<C_BOOL> TrueBuffer;
+
+COREARRAY_DLL_LOCAL size_t RLength(PyObject *val)
+{
+	if (val==NULL || val==Py_None) return 0;
+	if (PyArray_Check(val)) return PyArray_SIZE(val);
+	if (PyList_Check(val)) return PyList_Size(val);
+	return 1;
+}
+
+
+/// Allocate a NumPy object given by the SVType of a GDS node
+COREARRAY_DLL_LOCAL PyObject* RObject_GDS(PdAbstractArray Node, size_t n,
+	bool bit1_is_logical)
+{
+	PyObject *ans = NULL;
+	C_SVType SVType = GDS_Array_GetSVType(Node);
+
+	if (COREARRAY_SV_INTEGER(SVType))
+	{
+		char classname[128];
+		GDS_Node_GetClassName(Node, classname, sizeof(classname));
+		if ((strcmp(classname, "dBit1")==0) && bit1_is_logical)
+			ans = numpy_new_bool(n);
+		else if (GDS_Is_RLogical(Node))
+			ans = numpy_new_bool(n);
+		else
+			ans = numpy_new_int32(n);
+	} else if (COREARRAY_SV_FLOAT(SVType))
+	{
+		ans = numpy_new_double(n);
+	} else if (COREARRAY_SV_STRING(SVType))
+	{
+		ans = numpy_new_string(n);
+	}
+
+	return ans;
+}
+
+
+/// Append data of a NumPy/Python object to a GDS node
+COREARRAY_DLL_LOCAL void RAppendGDS(PdAbstractArray Node, PyObject *Val)
+{
+	if (Val==NULL || Val==Py_None)
+		return;
+	if (PyArray_Check(Val))
+	{
+		size_t n = PyArray_SIZE(Val);
+		void *ptr = PyArray_DATA(Val);
+		switch (PyArray_TYPE(Val))
+		{
+		case NPY_BOOL:
+		case NPY_INT8:
+			GDS_Array_AppendData(Node, n, ptr, svInt8); break;
+		case NPY_UINT8:
+			GDS_Array_AppendData(Node, n, ptr, svUInt8); break;
+		case NPY_INT16:
+			GDS_Array_AppendData(Node, n, ptr, svInt16); break;
+		case NPY_UINT16:
+			GDS_Array_AppendData(Node, n, ptr, svUInt16); break;
+		case NPY_INT32:
+			GDS_Array_AppendData(Node, n, ptr, svInt32); break;
+		case NPY_UINT32:
+			GDS_Array_AppendData(Node, n, ptr, svUInt32); break;
+		case NPY_INT64:
+			GDS_Array_AppendData(Node, n, ptr, svInt64); break;
+		case NPY_FLOAT32:
+			GDS_Array_AppendData(Node, n, ptr, svFloat32); break;
+		case NPY_FLOAT64:
+			GDS_Array_AppendData(Node, n, ptr, svFloat64); break;
+		case NPY_OBJECT:
+			{
+				vector<string> buf;
+				numpy_to_string(Val, buf);
+				GDS_Array_AppendData(Node, buf.size(),
+					buf.empty() ? NULL : &buf[0], svStrUTF8);
+			}
+			break;
+		default:
+			throw ErrSeqArray("the user-defined function returned an "
+				"unsupported NumPy data type.");
+		}
+	} else if (PyList_Check(Val))
+	{
+		vector<string> buf;
+		numpy_to_string(Val, buf);
+		GDS_Array_AppendData(Node, buf.size(),
+			buf.empty() ? NULL : &buf[0], svStrUTF8);
+	} else
+		throw ErrSeqArray("the user-defined function should return an array.");
+}
+
 
 COREARRAY_DLL_LOCAL C_BOOL *NeedArrayTRUEs(size_t len)
 {
@@ -1065,7 +1532,6 @@ COREARRAY_DLL_LOCAL void GetAlleles(const char *alleles, vector<string> &out)
 }
 
 
-/// get PdGDSObj from a SEXP object
 COREARRAY_DLL_LOCAL void GDS_PATH_PREFIX_CHECK(const char *path)
 {
 	for (; *path != 0; path++)
@@ -1093,7 +1559,6 @@ COREARRAY_DLL_LOCAL void GDS_VARIABLE_NAME_CHECK(const char *p)
 }
 
 
-/// get PdGDSObj from a SEXP object
 COREARRAY_DLL_LOCAL string GDS_PATH_PREFIX(const string &path, char prefix)
 {
 	string s = path;
@@ -1201,6 +1666,20 @@ COREARRAY_DLL_LOCAL PyObject* numpy_new_int32_dim3(size_t n1, size_t n2, size_t 
 }
 
 
+COREARRAY_DLL_LOCAL PyObject* numpy_new_double(size_t n)
+{
+	return new_array(n, NPY_FLOAT64);
+}
+
+COREARRAY_DLL_LOCAL PyObject* numpy_new_double_mat(size_t n1, size_t n2)
+{
+	npy_intp dims[2] = { (npy_intp)n1, (npy_intp)n2 };
+	PyObject *rv = PyArray_SimpleNew(2, dims, NPY_FLOAT64);
+	if (rv == NULL) throw ErrSeqArray(err_new_array);
+	return rv;
+}
+
+
 COREARRAY_DLL_LOCAL PyObject* numpy_new_string(size_t n)
 {
 	return new_array(n, NPY_OBJECT);
@@ -1291,6 +1770,7 @@ COREARRAY_DLL_LOCAL void numpy_to_int32(PyObject *obj, vector<int> &out)
 		int *p = &out[0];
 		switch (PyArray_TYPE(obj))
 		{
+		case NPY_BOOL:
 		case NPY_INT8:
 			for (C_Int8 *s=(C_Int8*)ptr; n > 0; n--) *p++ = *s++;
 			return;
@@ -1317,7 +1797,7 @@ COREARRAY_DLL_LOCAL void numpy_to_int32(PyObject *obj, vector<int> &out)
 			return;
 		}
 	}
-	throw ErrSeqArray("Fails to convert a numpty object to an integer vector.");
+	throw ErrSeqArray("Fails to convert a numpy object to an integer vector.");
 }
 
 COREARRAY_DLL_LOCAL void numpy_to_string(PyObject *obj, vector<string> &out)
@@ -1353,7 +1833,7 @@ COREARRAY_DLL_LOCAL void numpy_to_string(PyObject *obj, vector<string> &out)
 		#endif
 		}
 	} else
-		throw ErrSeqArray("Fails to convert a list or a numpty object to a string vector.");
+		throw ErrSeqArray("Fails to convert a list or a numpy object to a string vector.");
 }
 
 }
