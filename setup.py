@@ -61,7 +61,7 @@ SEQARRAY_TUS = [os.path.join(SEQ_SRC, fn) for fn in [
 ]]
 
 SHIM_TUS = ['csrc/cclib.cpp', 'csrc/Rshim.cpp', 'csrc/gds_bridge.cpp',
-            'csrc/conn.cpp', 'csrc/native_api.cpp']
+            'csrc/conn.cpp', 'csrc/native_api.cpp', 'csrc/vcf_api.cpp']
 
 ext = Extension(
     'PySeqArray.cclib',

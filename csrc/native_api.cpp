@@ -13,6 +13,8 @@
 #define PY_ARRAY_UNIQUE_SYMBOL PYSEQARRAY_ARRAY_API
 #include <numpy/arrayobject.h>
 
+#include <cstring>
+
 #include "Rshim/Rshim_error.h"
 #include "native_api.h"
 #include "Index.h"            // CFileInfo, TSelection, GetFileInfo(int)
@@ -49,6 +51,72 @@ static PyObject *get_selection(int fileid, bool sample)
     npy_bool *o = (npy_bool *)PyArray_DATA((PyArrayObject *)arr);
     for (int i = 0; i < n; i++) o[i] = p[i] ? 1 : 0;
     return arr;
+}
+
+// ---- selection writes (no SEXP) --------------------------------------------
+// Write the engine's TSelection.pSample/pVariant directly, with the same
+// invalidation the engine's SEQ_SetSpace* would do: ClearStructSample drops the
+// cached genotype-selection (pFlagGenoSel) so genotype reads recompute against the
+// new sample set; ClearStructVariant resets varTrueNum=-1 so VariantSelNum recounts.
+static void apply_mask(int fid, PyObject *maskobj, bool sample, bool intersect)
+{
+    CFileInfo &File = GetFileInfo(fid);
+    TSelection &Sel = File.Selection();
+    int n = sample ? File.SampleNum() : File.VariantNum();
+    C_BOOL *p = sample ? Sel.pSample : Sel.pVariant;
+    PyArrayObject *a = (PyArrayObject *)PyArray_FROM_OTF(maskobj, NPY_BOOL,
+                                                         NPY_ARRAY_IN_ARRAY);
+    if (!a) throw Rsh_error("selection must be a 1-D boolean array");
+    if ((int)PyArray_SIZE(a) != n) {
+        Py_DECREF(a);
+        throw Rsh_error("selection length does not match the number of samples/variants");
+    }
+    const npy_bool *m = (const npy_bool *)PyArray_DATA(a);
+    if (sample) Sel.ClearStructSample(); else Sel.ClearStructVariant();
+    for (int i = 0; i < n; i++)
+        p[i] = intersect ? (p[i] && m[i]) : (m[i] ? 1 : 0);
+    Py_DECREF(a);
+}
+
+PyObject *PySeq_native_file_init(PyObject *, PyObject *args)
+{
+    int fid;
+    if (!PyArg_ParseTuple(args, "i", &fid)) return NULL;
+    return native_guard([&]() -> PyObject * {
+        GetFileInfo(fid).Selection();   // force selection to initialize (all TRUE)
+        Py_RETURN_NONE;
+    });
+}
+
+PyObject *PySeq_native_set_sample(PyObject *, PyObject *args)
+{
+    int fid, intersect = 0; PyObject *mask;
+    if (!PyArg_ParseTuple(args, "iO|i", &fid, &mask, &intersect)) return NULL;
+    return native_guard([&]() -> PyObject * {
+        apply_mask(fid, mask, true, intersect != 0); Py_RETURN_NONE;
+    });
+}
+
+PyObject *PySeq_native_set_variant(PyObject *, PyObject *args)
+{
+    int fid, intersect = 0; PyObject *mask;
+    if (!PyArg_ParseTuple(args, "iO|i", &fid, &mask, &intersect)) return NULL;
+    return native_guard([&]() -> PyObject * {
+        apply_mask(fid, mask, false, intersect != 0); Py_RETURN_NONE;
+    });
+}
+
+PyObject *PySeq_native_reset(PyObject *, PyObject *args)
+{
+    int fid, sample = 1, variant = 1;
+    if (!PyArg_ParseTuple(args, "i|ii", &fid, &sample, &variant)) return NULL;
+    return native_guard([&]() -> PyObject * {
+        CFileInfo &File = GetFileInfo(fid);
+        TSelection &Sel = File.Selection();
+        if (sample) { Sel.ClearStructSample(); memset(Sel.pSample, 1, File.SampleNum()); }
+        if (variant) { Sel.ClearStructVariant(); memset(Sel.pVariant, 1, File.VariantNum()); }
+        Py_RETURN_NONE;
+    });
 }
 
 PyObject *PySeq_native_dims(PyObject *, PyObject *args)

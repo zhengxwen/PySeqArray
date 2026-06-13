@@ -23,6 +23,8 @@ import numpy as np
 import pygds
 
 from . import cclib
+from ._vcf import seqVCF2GDS
+from ._write import seqAddValue, seqDelete, seqRecompress
 
 __version__ = "0.2.0"
 
@@ -42,10 +44,23 @@ class SeqVarGDSClass:
         self.fileid = gds.fileid
         self.filename = gds.filename
 
+    def _dims(self):
+        # (nSamp, nVar, ploidy, nSampSel, nVarSel) via the native CFileInfo path
+        return cclib.n_dims(self.fileid)
+
+    def nsamp(self):
+        return self._dims()[0]
+
+    def nvar(self):
+        return self._dims()[1]
+
+    def ploidy(self):
+        return self._dims()[2]
+
     def __repr__(self):
-        ns = int(np.asarray(cclib.get_sample_sel(self.fileid)).sum())
-        nv = int(np.asarray(cclib.get_variant_sel(self.fileid)).sum())
-        return f"SeqVarGDSClass: {self.filename} (selected {ns} samples, {nv} variants)"
+        d = self._dims()
+        return (f"SeqVarGDSClass: {self.filename} "
+                f"(selected {d[3]}/{d[0]} samples, {d[4]}/{d[1]} variants)")
 
 
 def seqOpen(filename, readonly=True, allow_dup=False):
@@ -62,24 +77,252 @@ def seqClose(f):
     f.gds.close()
 
 
-def seqGetData(f, name, use_raw=False):
-    """Read field ``name`` for the current selection, via the SeqArray engine.
+class TVarData:
+    """Result of :func:`seqGetData` for a variable-length info/format field.
 
-    The genotype-family fields (``"genotype"``, ``"$dosage"``, ``"$dosage_alt"``)
-    take the SEXP-free native path (``cclib.native_*``, driving the engine's
-    CApply_Variant_* readers straight into numpy); everything else uses the engine
-    entry point.  Returns a numpy array (multi-dimensional fields in numpy C-order,
-    reversed relative to R's column-major dims), a list, or ``None``.  Missing
-    integer entries use R's ``NA_INTEGER`` (-2147483648); see :func:`na_mask`.
+    ``length`` is the per-selected-variant entry count; ``data`` is the
+    concatenated values across the selected variants.
     """
+    __slots__ = ("length", "data")
+
+    def __init__(self, length, data):
+        self.length = np.asarray(length, dtype=np.int32)
+        self.data = data
+
+    def __repr__(self):
+        return f"TVarData({len(self.length)} variants)"
+
+
+_VARIANT_FIELDS = ("variant.id", "position", "chromosome", "allele",
+                   "annotation/id", "annotation/qual", "annotation/filter")
+
+
+def _exist(f, path):
+    return f.gds.root().exist(path)
+
+
+def _offsets(cnt):
+    o = np.zeros(len(cnt) + 1, dtype=np.int64)
+    if len(cnt):
+        o[1:] = np.cumsum(cnt)
+    return o
+
+
+def _read_info(f, path, svar):
+    node = f.gds.index(path)
+    field = path.rsplit("/", 1)[1]
+    idxpath = path[:len(path) - len(field)] + "@" + field
+    if not _exist(f, idxpath):
+        vmask = np.zeros(f.nvar(), dtype=bool); vmask[svar] = True
+        return np.asarray(node.readex([vmask]))           # fixed: one per variant
+    cnt = np.asarray(f.gds.index(idxpath).read()).astype(np.int64)
+    full = np.asarray(node.read())
+    off = _offsets(cnt)
+    lens = cnt[svar]
+    if np.all(lens == 1):
+        return full[off[svar]]
+    pieces = [full[off[v]:off[v + 1]] for v in svar]
+    return TVarData(lens, np.concatenate(pieces) if pieces else full[:0])
+
+
+def _read_format(f, path, svar, smask):
+    field = path[len("annotation/format/"):]
+    if field.endswith("/data"):
+        field = field[:-len("/data")]
+    base = "annotation/format/" + field
+    node = f.gds.index(base + "/data")
+    idxpath = base + "/@data"
+    cnt = (np.ones(f.nvar(), dtype=np.int64) if not _exist(f, idxpath)
+           else np.asarray(f.gds.index(idxpath).read()).astype(np.int64))
+    off = _offsets(cnt)
+    cols = (np.concatenate([np.arange(off[v], off[v + 1]) for v in svar])
+            if len(svar) else np.array([], dtype=np.int64))
+    total_cols = int(node.description()["dim"][0])       # numpy [cols, sample]
+    colmask = np.zeros(total_cols, dtype=bool); colmask[cols] = True
+    mat = np.asarray(node.readex([colmask, smask]))       # (ncols, nSampSel)
+    if np.all(cnt[svar] == 1):
+        return mat                                        # (variant, sample)
+    return TVarData(cnt[svar], mat)
+
+
+def seqGetData(f, name, use_raw=False):
+    """Read field ``name`` for the current selection — fully SEXP-free.
+
+    Genotype-family fields drive the engine's CApply_Variant_* readers straight
+    into numpy (``cclib.genotype``/``cclib.dosage``); else a plain pygds read honoured
+    against the current selection masks.  Returns a numpy array (multi-dimensional
+    fields in numpy C-order, reversed vs R's column-major dims), a list, a
+    :class:`TVarData` (variable-length info/format), or ``None``.  Missing integer
+    entries use R's ``NA_INTEGER`` (-2147483648); see :func:`na_mask`.
+    """
+    fid = f.fileid
     if not use_raw:
         if name == "genotype":
-            return cclib.native_genotype(f.fileid)
+            return cclib.genotype(fid)
         if name == "$dosage":
-            return cclib.native_dosage(f.fileid, 0)
+            return cclib.dosage(fid, 0)
         if name == "$dosage_alt":
-            return cclib.native_dosage(f.fileid, 1)
-    return cclib.get_data(f.fileid, name, 1 if use_raw else 0)
+            return cclib.dosage(fid, 1)
+
+    vmask = np.asarray(cclib.get_variant_sel(fid)).astype(bool)
+    smask = np.asarray(cclib.get_sample_sel(fid)).astype(bool)
+    svar = np.nonzero(vmask)[0]
+    gds = f.gds
+
+    # ---- sample-level ------------------------------------------------------
+    if name == "sample.id":
+        return np.asarray(gds.index("sample.id").readex([smask]))
+    if name == "$sample_index":
+        return np.nonzero(smask)[0]
+    if name == "$variant_index":
+        return svar
+
+    # ---- fixed variant-level (pygds applies factor levels for filter) ------
+    if name in _VARIANT_FIELDS:
+        return np.asarray(gds.index(name).readex([vmask]))
+
+    # ---- derived -----------------------------------------------------------
+    if name in ("$num_allele", "$ref", "$alt", "$chrom_pos"):
+        if name == "$chrom_pos":
+            ch = np.asarray(gds.index("chromosome").readex([vmask]))
+            ps = np.asarray(gds.index("position").readex([vmask]))
+            return np.array([f"{c}:{p}" for c, p in zip(ch, ps)], dtype=object)
+        al = np.asarray(gds.index("allele").readex([vmask]))
+        if name == "$num_allele":
+            return np.array([str(a).count(",") + 1 for a in al], dtype=np.int32)
+        if name == "$ref":
+            return np.array([str(a).split(",", 1)[0] for a in al], dtype=object)
+        return np.array([(str(a).split(",", 1) + [""])[1] for a in al], dtype=object)
+
+    # ---- phase (Bit1, numpy [variant, sample]) -----------------------------
+    if name == "phase":
+        if not _exist(f, "phase/data"):
+            return None
+        return np.asarray(gds.index("phase/data").readex([vmask, smask]))
+
+    # ---- annotations -------------------------------------------------------
+    if name.startswith("sample.annotation/"):
+        return np.asarray(gds.index(name).readex([smask]))
+    if name.startswith("annotation/info/"):
+        return _read_info(f, name, svar)
+    if name.startswith("annotation/format/"):
+        return _read_format(f, name, svar, smask)
+
+    raise ValueError(f"seqGetData: unsupported field name '{name}'")
+
+
+def seqApply(fun, f, name, margin="by.variant", as_is="list", bsize=1, **kwargs):
+    """Apply ``fun`` over the selected variants (or samples), ``bsize`` per call.
+
+    SEXP-free: each block sets a sub-selection and reads via the native
+    :func:`seqGetData`.  ``name`` is a field name or a list of names (``fun`` then
+    receives a tuple).  ``margin`` is ``"by.variant"`` (default) or ``"by.sample"``;
+    ``as_is`` is ``"list"`` (collect), ``"unlist"`` (concatenate) or ``"none"``.
+    """
+    by_variant = margin == "by.variant"
+    if not by_variant and margin != "by.sample":
+        raise ValueError('margin must be "by.variant" or "by.sample"')
+    s0, v0 = seqGetFilter(f)                       # save selection
+    units = np.nonzero(v0 if by_variant else s0)[0]
+    results = []
+    try:
+        i = 0
+        while i < len(units):
+            blk = units[i:i + bsize]
+            m = np.zeros(len(v0) if by_variant else len(s0), dtype=bool)
+            m[blk] = True
+            if by_variant:
+                seqSetFilter(f, variant_sel=m, verbose=False)
+            else:
+                seqSetFilter(f, sample_sel=m, verbose=False)
+            data = (seqGetData(f, name) if isinstance(name, str)
+                    else tuple(seqGetData(f, n) for n in name))
+            r = fun(*data, **kwargs) if isinstance(data, tuple) else fun(data, **kwargs)
+            if as_is != "none":
+                results.append(r)
+            i += bsize
+    finally:
+        seqSetFilter(f, sample_sel=s0, variant_sel=v0, verbose=False)
+    if as_is == "none":
+        return None
+    if as_is == "list":
+        return results
+    if as_is == "unlist":
+        if not results:
+            return np.array([])
+        return np.concatenate([np.atleast_1d(np.asarray(r)).ravel() for r in results])
+    raise ValueError(f"unsupported as_is={as_is!r}")
+
+
+def seqBlockApply(fun, f, name, margin="by.variant", as_is="list", bsize=1024,
+                  **kwargs):
+    """Like :func:`seqApply` but a block of ``bsize`` units per call (default 1024)."""
+    return seqApply(fun, f, name, margin=margin, as_is=as_is, bsize=bsize, **kwargs)
+
+
+def _parallel_worker(arg):
+    filename, units, sel0, name, margin, as_is, kwargs = arg
+    by_variant = margin == "by.variant"
+    f = seqOpen(filename, allow_dup=True)
+    try:
+        s0, v0 = sel0
+        # restore the outer filter, then restrict to this worker's unit chunk
+        seqSetFilter(f, sample_sel=s0, variant_sel=v0, verbose=False)
+        full = v0 if by_variant else s0
+        m = np.zeros(len(full), dtype=bool)
+        m[units] = True
+        m &= full
+        if by_variant:
+            seqSetFilter(f, variant_sel=m, verbose=False)
+        else:
+            seqSetFilter(f, sample_sel=m, verbose=False)
+        return seqApply(_PARALLEL_FUN, f, name, margin=margin, as_is=as_is, **kwargs)
+    finally:
+        seqClose(f)
+
+
+_PARALLEL_FUN = None
+
+
+def _set_parallel_fun(fun):
+    global _PARALLEL_FUN
+    _PARALLEL_FUN = fun
+
+
+def seqParallel(fun, f, name, margin="by.variant", as_is="list", ncpu=2,
+                **kwargs):
+    """Parallel :func:`seqApply` over ``ncpu`` worker processes.
+
+    The current selection is split into ``ncpu`` contiguous unit-chunks; each
+    worker re-opens the file (``allow_dup=True``), applies ``fun`` to its chunk,
+    and the results are concatenated in order.  ``fun`` must be importable by the
+    workers (a module-level function — not a lambda/closure), the same constraint
+    R's ``seqParallel`` places on cluster functions.  ``as_is="unlist"`` returns a
+    single concatenated array; ``"list"`` a flat list.
+    """
+    import multiprocessing as mp
+
+    by_variant = margin == "by.variant"
+    s0, v0 = seqGetFilter(f)
+    units = np.nonzero(v0 if by_variant else s0)[0]
+    if ncpu <= 1 or len(units) <= 1:
+        return seqApply(fun, f, name, margin=margin, as_is=as_is, **kwargs)
+    chunks = [c for c in np.array_split(units, ncpu) if len(c)]
+    args = [(f.filename, c.tolist(), (s0, v0), name, margin, as_is, kwargs)
+            for c in chunks]
+    _set_parallel_fun(fun)            # fork inherits this -> fun need not be picklable
+    ctx = mp.get_context("fork")
+    with ctx.Pool(len(chunks)) as pool:
+        parts = pool.map(_parallel_worker, args)
+    if as_is == "none":
+        return None
+    if as_is == "unlist":
+        parts = [np.atleast_1d(np.asarray(p)) for p in parts if p is not None and len(np.atleast_1d(np.asarray(p)))]
+        return np.concatenate(parts) if parts else np.array([])
+    out = []
+    for p in parts:
+        out.extend(p if isinstance(p, list) else list(p))
+    return out
 
 
 def na_mask(arr):
@@ -206,9 +449,11 @@ def _report(f):
 
 
 __all__ = [
-    "SeqVarGDSClass",
+    "SeqVarGDSClass", "TVarData",
     "seqOpen", "seqClose", "seqGetData", "na_mask",
     "seqSetFilter", "seqResetFilter", "seqGetFilter",
+    "seqApply", "seqBlockApply", "seqParallel",
     "seqSummary", "seqExampleFileName",
     "seqNumAllele", "seqAlleleCount", "seqAlleleFreq", "seqMissing",
+    "seqVCF2GDS", "seqAddValue", "seqDelete", "seqRecompress",
 ]
