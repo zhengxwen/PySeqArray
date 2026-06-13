@@ -25,6 +25,11 @@
 extern "C" {
 SEXP SEQ_VCF_Parse(SEXP vcf_fn, SEXP header, SEXP gds_root, SEXP param,
                    SEXP line_cnt, SEXP rho);
+SEXP SEQ_ToVCF_Init(SEXP SelDim, SEXP ChrPrefix, SEXP Info, SEXP Format,
+                    SEXP File, SEXP Verbose);
+SEXP SEQ_ToVCF(SEXP X);
+SEXP SEQ_ToVCF_Done(void);
+void Rsh_close_connections(void);
 }
 
 // ===========================================================================
@@ -99,6 +104,16 @@ static SEXP py_to_sexp(PyObject *o)
     if (PyBytes_Check(o)) return Rf_mkString(PyBytes_AsString(o));
     if (PyDict_Check(o)) return dict_to_sexp(o);
     if (PyArray_Check(o)) {
+        PyArrayObject *a = (PyArrayObject *)o;
+        if (PyArray_TYPE(a) == NPY_UINT8 || PyArray_TYPE(a) == NPY_INT8) {
+            // -> RAWSXP (e.g. phase, which the VCF exporter reads via RAW())
+            PyArrayObject *c = (PyArrayObject *)PyArray_GETCONTIGUOUS(a);
+            R_xlen_t n = (R_xlen_t)PyArray_SIZE(c);
+            SEXP r = Rf_allocVector(RAWSXP, n);
+            memcpy(RAW(r), PyArray_DATA(c), n);
+            Py_DECREF(c);
+            return r;
+        }
         PyObject *lst = PySequence_List(o);
         SEXP r = list_to_sexp(lst);
         Py_DECREF(lst);
@@ -195,4 +210,79 @@ PyObject *PySeq_vcf_parse(PyObject *, PyObject *args)
     }
     Rsh_arena_reset();
     return result;
+}
+
+// ===========================================================================
+// seqGDS2VCF: export the (already-headered) VCF body, one variant per line
+// ===========================================================================
+
+static SEXP int_vec(PyObject *list)
+{
+    Py_ssize_t n = list ? PySequence_Size(list) : 0;
+    SEXP v = Rf_allocVector(INTSXP, n);
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *e = PySequence_GetItem(list, i);
+        INTEGER(v)[i] = (e && e != Py_None) ? (int)PyLong_AsLong(e) : NA_INTEGER;
+        Py_XDECREF(e);
+    }
+    return v;
+}
+
+// tovcf_init(ploidy, nsamp, chr_prefix, info_num_list, format_num_list, out_path)
+PyObject *PySeq_tovcf_init(PyObject *, PyObject *args)
+{
+    int ploidy, nsamp;
+    const char *chr_prefix, *out_path;
+    PyObject *info_num, *format_num;
+    if (!PyArg_ParseTuple(args, "iisOOs", &ploidy, &nsamp, &chr_prefix,
+                          &info_num, &format_num, &out_path))
+        return NULL;
+    try {
+        SEXP dim = Rf_allocVector(INTSXP, 2);
+        INTEGER(dim)[0] = ploidy; INTEGER(dim)[1] = nsamp;
+        SEXP cp = Rf_mkString(chr_prefix);
+        SEXP info = int_vec(info_num);
+        SEXP fmt = int_vec(format_num);
+        SEXP file = Rf_allocVector(STRSXP, 2);   // {path, mode} -> append
+        SET_STRING_ELT(file, 0, Rf_mkChar(out_path));
+        SET_STRING_ELT(file, 1, Rf_mkChar("ab"));
+        SEQ_ToVCF_Init(dim, cp, info, fmt, file, Rf_ScalarLogical(0));
+    } catch (std::exception &e) {
+        Rsh_arena_reset();
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return NULL;
+    }
+    Rsh_arena_reset();
+    Py_RETURN_NONE;
+}
+
+// tovcf_line(X) — X is the per-variant field list (chrom,pos,id,allele,qual,
+// filter,geno,phase, info..., format...).
+PyObject *PySeq_tovcf_line(PyObject *, PyObject *args)
+{
+    PyObject *x;
+    if (!PyArg_ParseTuple(args, "O", &x)) return NULL;
+    try {
+        SEQ_ToVCF(py_to_sexp(x));
+    } catch (std::exception &e) {
+        Rsh_arena_reset();
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return NULL;
+    }
+    Rsh_arena_reset();
+    Py_RETURN_NONE;
+}
+
+PyObject *PySeq_tovcf_done(PyObject *, PyObject *)
+{
+    try {
+        SEQ_ToVCF_Done();
+        Rsh_close_connections();
+    } catch (std::exception &e) {
+        Rsh_arena_reset();
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return NULL;
+    }
+    Rsh_arena_reset();
+    Py_RETURN_NONE;
 }

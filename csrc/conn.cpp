@@ -79,12 +79,13 @@ extern "C" Rconnection Rsh_open_connection(const char *path, const char *mode)
     return con;
 }
 
-// The connection SEXP is a STRSXP{ path }.
+// The connection SEXP is a STRSXP{ path } (read) or { path, mode } (e.g. "wb").
 extern "C" Rconnection R_GetConnection(SEXP sConn)
 {
     if (sConn == NULL || TYPEOF(sConn) != STRSXP || Rf_xlength(sConn) < 1)
         throw Rsh_error("R_GetConnection: expected a file-path string");
-    return Rsh_open_connection(R_CHAR(STRING_ELT(sConn, 0)), "rb");
+    const char *mode = (Rf_xlength(sConn) >= 2) ? R_CHAR(STRING_ELT(sConn, 1)) : "rb";
+    return Rsh_open_connection(R_CHAR(STRING_ELT(sConn, 0)), mode);
 }
 
 extern "C" size_t R_ReadConnection(Rconnection con, void *buf, size_t n)

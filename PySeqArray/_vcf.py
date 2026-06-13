@@ -216,3 +216,68 @@ def seqVCF2GDS(vcf_fn, out_fn, genotype_var_name="GT", verbose=True):
     finally:
         gfile.close()
     return str(out_fn)
+
+
+def seqGDS2VCF(f, out_fn, verbose=True):
+    """Export the current selection of a SeqArray GDS handle ``f`` to a VCF
+    file ``out_fn`` (gzip-compressed; .gz is appended if absent).
+
+    This first cut writes CHROM/POS/ID/REF/ALT/QUAL/FILTER + the GT genotype
+    column (INFO=".", no extra FORMAT fields).  ``f`` is a SeqVarGDSClass.
+    """
+    import gzip as _gz
+    from . import (seqGetData, seqGetFilter)
+
+    out_fn = str(out_fn)
+    if not out_fn.endswith(".gz"):
+        out_fn = out_fn + ".gz"
+
+    smask, vmask = seqGetFilter(f)[0], seqGetFilter(f)[1]
+    samples = list(np.asarray(seqGetData(f, "sample.id")))
+    nsamp = len(samples)
+    ploidy = f.ploidy()
+
+    # read all per-variant fields once
+    chrom = np.asarray(seqGetData(f, "chromosome")).astype(str)
+    pos = np.asarray(seqGetData(f, "position"))
+    vid = np.asarray(seqGetData(f, "annotation/id")).astype(str)
+    allele = np.asarray(seqGetData(f, "allele")).astype(str)
+    qual = np.asarray(seqGetData(f, "annotation/qual"))
+    filt = [str(x) for x in seqGetData(f, "annotation/filter")]
+    geno = np.asarray(seqGetData(f, "genotype"))            # (nvar, nsamp, ploidy)
+    phase = seqGetData(f, "phase")                          # (nvar, nsamp) or None
+    nvar = geno.shape[0]
+
+    # ---- header ----
+    levels = sorted(set(filt) | {"PASS"})
+    with _gz.open(out_fn, "wt") as h:
+        h.write("##fileformat=VCFv4.2\n")
+        for lv in levels:
+            h.write(f'##FILTER=<ID={lv},Description="{lv}">\n')
+        h.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
+        cols = ["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER",
+                "INFO", "FORMAT"] + samples
+        h.write("\t".join(cols) + "\n")
+
+    # ---- body via the engine ----
+    cclib.tovcf_init(ploidy, nsamp, "", [], [], out_fn)
+    try:
+        ph0 = (phase if phase is not None
+               else np.zeros((nvar, nsamp), dtype=np.uint8))
+        for i in range(nvar):
+            x = {
+                "chr": chrom[i],
+                "pos": int(pos[i]),
+                "id": "." if vid[i] in ("", "nan") else vid[i],
+                "allele": allele[i],
+                "qual": float(qual[i]),
+                "filter": filt[i],
+                "geno": geno[i].reshape(-1).tolist(),       # sample-major
+                "phase": np.ascontiguousarray(ph0[i], dtype=np.uint8),
+            }
+            cclib.tovcf_line(x)
+    finally:
+        cclib.tovcf_done()
+    if verbose:
+        print(f"seqGDS2VCF: {nvar} variants, {nsamp} samples -> {out_fn}")
+    return out_fn

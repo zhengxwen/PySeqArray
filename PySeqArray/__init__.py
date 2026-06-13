@@ -23,7 +23,7 @@ import numpy as np
 import pygds
 
 from . import cclib
-from ._vcf import seqVCF2GDS
+from ._vcf import seqVCF2GDS, seqGDS2VCF
 from ._write import seqAddValue, seqDelete, seqRecompress
 
 __version__ = "0.2.0"
@@ -455,5 +455,5 @@ __all__ = [
     "seqApply", "seqBlockApply", "seqParallel",
     "seqSummary", "seqExampleFileName",
     "seqNumAllele", "seqAlleleCount", "seqAlleleFreq", "seqMissing",
-    "seqVCF2GDS", "seqAddValue", "seqDelete", "seqRecompress",
+    "seqVCF2GDS", "seqGDS2VCF", "seqAddValue", "seqDelete", "seqRecompress",
 ]

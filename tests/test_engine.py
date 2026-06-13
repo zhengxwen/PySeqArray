@@ -177,6 +177,33 @@ def test_vcf2gds_roundtrip():
         os.remove(out)
 
 
+def test_gds2vcf_roundtrip():
+    """seqGDS2VCF export then seqVCF2GDS re-import preserves the genotype."""
+    import tempfile
+    tmp = tempfile.gettempdir()
+    vcf = os.path.join(tmp, "pyseq_exp.vcf.gz")
+    gds = os.path.join(tmp, "pyseq_reimp.gds")
+    for p in (vcf, gds):
+        if os.path.exists(p):
+            os.remove(p)
+    f = sa.seqOpen(sa.seqExampleFileName("gds"))
+    try:
+        sa.seqGDS2VCF(f, vcf, verbose=False)
+    finally:
+        sa.seqClose(f)
+    sa.seqVCF2GDS(vcf, gds, verbose=False)
+    f2 = sa.seqOpen(gds)
+    try:
+        g = np.asarray(sa.seqGetData(f2, "genotype"))
+        nm = sa.na_mask(g)
+        assert int(g[~nm].sum()) == 32683
+        assert int(nm.sum()) == 17216
+    finally:
+        sa.seqClose(f2)
+        for p in (vcf, gds):
+            os.remove(p)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

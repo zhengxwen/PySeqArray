@@ -40,6 +40,9 @@ static PyMethodDef cclib_methods[] = {
     // VCF (SEXP marshalling confined here)
     {"sexp_roundtrip",  PySeq_sexp_roundtrip,        METH_VARARGS, "Debug: round-trip a Python value through the shim SEXP marshaller."},
     {"vcf_parse",       PySeq_vcf_parse,             METH_VARARGS, "seqVCF2GDS body parse: (vcf_path, header, out_fileid, param) -> nlines."},
+    {"tovcf_init",      PySeq_tovcf_init,            METH_VARARGS, "seqGDS2VCF: (ploidy,nsamp,chr_prefix,info_num,fmt_num,out_path)."},
+    {"tovcf_line",      PySeq_tovcf_line,            METH_VARARGS, "seqGDS2VCF: write one variant line from X list."},
+    {"tovcf_done",      PySeq_tovcf_done,            METH_NOARGS,  "seqGDS2VCF: finalize + close."},
     {NULL, NULL, 0, NULL}
 };
 
