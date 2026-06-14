@@ -1127,6 +1127,14 @@ from PySeqArray._vcf_import import (  # noqa: E402,F401
 
 
 # ===========================================================================
+# Streaming numeric writer (block append; no VCF text)
+# ===========================================================================
+
+from PySeqArray._writer import (  # noqa: E402,F401
+	SeqVarGDSWriter, seqCreateGDS, seqAppendVariants, seqCloseGDS)
+
+
+# ===========================================================================
 # Format converters (PLINK BED, subset export)
 # ===========================================================================
 
