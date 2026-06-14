@@ -355,18 +355,23 @@ def _write_gds(out_fn, fileformat, samples, chrom_l, pos_l, id_l, ref_alt_l,
 	for k in fmt_extra:
 		fld = fmt_fields[k]
 		rows = fmt_acc[k]['vals']  # list per variant of [per-sample str]
-		flat = []
-		cnts = []
-		for row in rows:
-			# number of records per variant (here 1 set of nSamp values)
-			cnts.append(1)
-			flat.append(row)
-		mat = _coerce_matrix(flat, fld.storage, nSamp)
 		fdir = fmt_node.addfolder(k)
 		_set_field_attr(fdir, fld)
-		fdir.add('data', mat, storage=fld.storage, compress=C, closezip=True)
-		fdir.add('@data', np.ones(nVar, dtype=np.int32), storage='int32',
-			compress=C, visible=False, closezip=True)
+		if fld.fixed:
+			# Number==1: one value per sample -> (nVar, nSamp), @data = 1
+			mat = _coerce_matrix(rows, fld.storage, nSamp)
+			fdir.add('data', mat, storage=fld.storage, compress=C,
+				closezip=True)
+			fdir.add('@data', np.ones(nVar, dtype=np.int32), storage='int32',
+				compress=C, visible=False, closezip=True)
+		else:
+			# variable length (e.g. AD/PL): parse the per-sample comma lists
+			# into the SeqArray variant-blocked layout + per-variant counts
+			data, cnts = _coerce_format_var(rows, fld.storage, nSamp)
+			fdir.add('data', data, storage=fld.storage, compress=C,
+				closezip=True)
+			fdir.add('@data', cnts, storage='int32', compress=C,
+				visible=False, closezip=True)
 
 	# description
 	d = r.addfolder('description')
@@ -426,3 +431,52 @@ def _coerce_matrix(rows, storage, nSamp):
 		for j, v in enumerate(row):
 			m[i, j] = '' if v == '.' else str(v)
 	return m
+
+
+def _coerce_format_var(rows, storage, nSamp):
+	"""Variable-length FORMAT (e.g. AD/PL): each per-sample cell is a comma
+	list.  Return (data, counts): `data` is the SeqArray variant-blocked matrix
+	(sum(counts) x nSamp, value-major within each variant) and `counts` is the
+	per-variant value count (= #values per sample at that variant)."""
+	blocks, counts = [], []
+	for row in rows:
+		parts = [None if (c in ('.', '')) else str(c).split(',') for c in row]
+		cv = max((len(p) for p in parts if p is not None), default=1)
+		if storage == 'int32':
+			blk = np.full((cv, nSamp), _NA_INT32, np.int32)
+		elif storage in ('float64', 'float32'):
+			blk = np.full((cv, nSamp),
+				np.nan, np.float64 if storage == 'float64' else np.float32)
+		else:
+			blk = np.full((cv, nSamp), '', dtype=object)
+		for s, p in enumerate(parts):
+			if p is None:
+				continue
+			for j in range(min(cv, len(p))):
+				v = p[j]
+				if v in ('.', ''):
+					continue
+				if storage == 'int32':
+					try:
+						blk[j, s] = int(v)
+					except ValueError:
+						pass
+				elif storage in ('float64', 'float32'):
+					try:
+						blk[j, s] = float(v)
+					except ValueError:
+						pass
+				else:
+					blk[j, s] = str(v)
+		blocks.append(blk)
+		counts.append(cv)
+	if blocks:
+		data = np.concatenate(blocks, axis=0)
+	elif storage == 'int32':
+		data = np.empty((0, nSamp), np.int32)
+	elif storage in ('float64', 'float32'):
+		data = np.empty((0, nSamp),
+			np.float64 if storage == 'float64' else np.float32)
+	else:
+		data = np.empty((0, nSamp), dtype=object)
+	return data, np.asarray(counts, np.int32)

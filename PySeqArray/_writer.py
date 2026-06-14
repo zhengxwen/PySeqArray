@@ -75,6 +75,16 @@ def _coerce_2d(v, storage, k, nsamp):
 	return np.asarray(v, dtype=object).reshape(k, nsamp)
 
 
+def _np_dtype(storage):
+	if storage == 'int32':
+		return np.int32
+	if storage == 'float64':
+		return np.float64
+	if storage == 'float32':
+		return np.float32
+	return object
+
+
 def _set_attrs(node, fld):
 	node.putattr('Number', str(fld.get('Number', '.')))
 	node.putattr('Type', str(fld.get('Type', 'String')))
@@ -193,19 +203,22 @@ class SeqVarGDSWriter:
 					storage)
 			_set_attrs(info_node.index(k), fld)
 
-		# FORMAT fields (Number=1 only in this milestone)
+		# FORMAT fields.  Number=='1' -> fixed (one value per genotype);
+		# anything else (R/G/A/./int>1) -> variable length (per-variant count
+		# in @data, data is variant-blocked: count_v rows x nSamp per variant).
 		self.format_fields = dict(format_fields) if format_fields else {}
 		fmt_node = a.addfolder('format')
-		self._fmt = {}   # name -> (datanode, idxnode, storage)
+		self._fmt = {}   # name -> (datanode, idxnode, storage, kind)
 		for k, fld in self.format_fields.items():
 			storage = _TYPE_STORAGE.get(fld.get('Type', 'String'), 'string')
+			kind = 'fixed' if str(fld.get('Number', '1')) == '1' else 'var'
 			fdir = fmt_node.addfolder(k)
 			_set_attrs(fdir, fld)
 			dn = fdir.add('data', _empty_2d(storage, self.nSamp),
 				storage=storage, compress=self.C, closezip=False)
 			di = fdir.add('@data', np.empty(0, np.int32), storage='int32',
 				compress=self.C, visible=False, closezip=False)
-			self._fmt[k] = (dn, di, storage)
+			self._fmt[k] = (dn, di, storage, kind)
 
 	# -- streaming append -------------------------------------------------
 
@@ -281,11 +294,24 @@ class SeqVarGDSWriter:
 						n.append(_coerce_1d(flat, storage, len(flat)))
 					idx.append(np.asarray(counts, np.int32))
 
-		# FORMAT (Number=1)
-		for name, (dn, di, storage) in self._fmt.items():
+		# FORMAT.  Fixed: value is a (k, nSamp) array.  Variable: value is
+		# (data_block, counts) where data_block is (sum(counts), nSamp)
+		# variant-blocked (value-major within each variant) and counts is the
+		# per-variant value count.
+		for name, (dn, di, storage, kind) in self._fmt.items():
 			v = format.get(name)
-			dn.append(_coerce_2d(v, storage, k, self.nSamp))
-			di.append(np.ones(k, np.int32))
+			if kind == 'fixed':
+				dn.append(_coerce_2d(v, storage, k, self.nSamp))
+				di.append(np.ones(k, np.int32))
+			elif v is None:
+				di.append(np.zeros(k, np.int32))
+			else:
+				data_block, counts = v
+				data_block = np.asarray(data_block)
+				if data_block.shape[0]:
+					dn.append(data_block.astype(_np_dtype(storage),
+						copy=False))
+				di.append(np.asarray(counts, np.int32))
 
 		self._nvar += k
 		return self._nvar
@@ -322,7 +348,7 @@ class SeqVarGDSWriter:
 			n.readmode()
 			if idx is not None:
 				idx.readmode()
-		for (dn, di, storage) in self._fmt.values():
+		for (dn, di, storage, kind) in self._fmt.values():
 			dn.readmode()
 			di.readmode()
 		self.f.close()
