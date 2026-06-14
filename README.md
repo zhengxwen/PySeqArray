@@ -1,6 +1,8 @@
 PySeqArray: data manipulation of whole-genome sequencing variants with SeqArray files in Python
 ===
 
+[![CI](https://github.com/CoreArray/PySeqArray/actions/workflows/ci.yml/badge.svg)](https://github.com/CoreArray/PySeqArray/actions/workflows/ci.yml)
+
 ![GPLv3](http://www.gnu.org/graphics/gplv3-88x31.png)
 [GNU General Public License, GPLv3](http://www.gnu.org/copyleft/gpl.html) (2017)
 
