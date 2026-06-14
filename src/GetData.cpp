@@ -346,7 +346,7 @@ static PyObject* VarGetData(CFileInfo &File, const char *name)
 		string name1 = string(name) + "/data";
 		PdAbstractArray N = File.GetObj(name1.c_str(), TRUE);
 
-		CIndex &V = VarGetStruct(File, name).Index;
+		CIndex &V = VarGetStruct(File, name1).Index;
 		int var_start, var_count;
 		vector<C_BOOL> var_sel;
 		PyObject *Index = V.GetLen_Sel(Sel.pVariant, var_start, var_count, var_sel);

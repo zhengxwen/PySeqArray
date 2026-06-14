@@ -1764,38 +1764,38 @@ COREARRAY_DLL_LOCAL void numpy_to_int32(PyObject *obj, vector<int> &out)
 {
 	if (PyArray_Check(obj))
 	{
-		void *ptr = PyArray_DATA(obj);
-		size_t n = PyArray_SIZE(obj);
+		// ensure C-contiguous: a strided view (e.g. arr[0:60:3]) would
+		// otherwise be read from its base buffer ignoring the stride.
+		PyObject *cont = (PyObject*)PyArray_GETCONTIGUOUS((PyArrayObject*)obj);
+		void *ptr = PyArray_DATA(cont);
+		size_t n = PyArray_SIZE(cont);
 		out.resize(n);
 		int *p = &out[0];
-		switch (PyArray_TYPE(obj))
+		bool ok = true;
+		switch (PyArray_TYPE(cont))
 		{
 		case NPY_BOOL:
 		case NPY_INT8:
-			for (C_Int8 *s=(C_Int8*)ptr; n > 0; n--) *p++ = *s++;
-			return;
+			for (C_Int8 *s=(C_Int8*)ptr; n > 0; n--) *p++ = *s++; break;
 		case NPY_UINT8:
-			for (C_UInt8 *s=(C_UInt8*)ptr; n > 0; n--) *p++ = *s++;
-			return;
+			for (C_UInt8 *s=(C_UInt8*)ptr; n > 0; n--) *p++ = *s++; break;
 		case NPY_INT16:
-			for (C_Int16 *s=(C_Int16*)ptr; n > 0; n--) *p++ = *s++;
-			return;
+			for (C_Int16 *s=(C_Int16*)ptr; n > 0; n--) *p++ = *s++; break;
 		case NPY_UINT16:
-			for (C_UInt16 *s=(C_UInt16*)ptr; n > 0; n--) *p++ = *s++;
-			return;
+			for (C_UInt16 *s=(C_UInt16*)ptr; n > 0; n--) *p++ = *s++; break;
 		case NPY_INT32:
-			for (C_Int32 *s=(C_Int32*)ptr; n > 0; n--) *p++ = *s++;
-			return;
+			for (C_Int32 *s=(C_Int32*)ptr; n > 0; n--) *p++ = *s++; break;
 		case NPY_UINT32:
-			for (C_UInt32 *s=(C_UInt32*)ptr; n > 0; n--) *p++ = *s++;
-			return;
+			for (C_UInt32 *s=(C_UInt32*)ptr; n > 0; n--) *p++ = *s++; break;
 		case NPY_INT64:
-			for (C_Int64 *s=(C_Int64*)ptr; n > 0; n--) *p++ = *s++;
-			return;
+			for (C_Int64 *s=(C_Int64*)ptr; n > 0; n--) *p++ = *s++; break;
 		case NPY_UINT64:
-			for (C_UInt64 *s=(C_UInt64*)ptr; n > 0; n--) *p++ = *s++;
-			return;
+			for (C_UInt64 *s=(C_UInt64*)ptr; n > 0; n--) *p++ = *s++; break;
+		default:
+			ok = false;
 		}
+		Py_DECREF(cont);
+		if (ok) return;
 	}
 	throw ErrSeqArray("Fails to convert a numpy object to an integer vector.");
 }
@@ -1808,8 +1808,10 @@ COREARRAY_DLL_LOCAL void numpy_to_string(PyObject *obj, vector<string> &out)
 		out[0] = PYSTR_CHAR(obj);
 	} else if (PyArray_Check(obj))
 	{
-		PyObject **p = (PyObject**)PyArray_DATA(obj);
-		size_t n = PyArray_SIZE(obj);
+		// ensure C-contiguous (handle strided object-array views)
+		PyObject *cont = (PyObject*)PyArray_GETCONTIGUOUS((PyArrayObject*)obj);
+		PyObject **p = (PyObject**)PyArray_DATA(cont);
+		size_t n = PyArray_SIZE(cont);
 		out.resize(n);
 		for (size_t i=0; i < n; i++)
 		{
@@ -1819,6 +1821,7 @@ COREARRAY_DLL_LOCAL void numpy_to_string(PyObject *obj, vector<string> &out)
 			out[i] = PyString_AsString(*p++);
 		#endif
 		}
+		Py_DECREF(cont);
 	} else if (PyList_Check(obj))
 	{
 		size_t n = PyList_Size(obj);

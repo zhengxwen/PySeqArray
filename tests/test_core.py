@@ -241,6 +241,27 @@ def test_seqmerge():
     ps.seqClose(m)
 
 
+def test_strided_filter_and_selectors():
+    # a STRIDED id array (step != 1) must select the right variants
+    f = _open()
+    vid = np.asarray(ps.seqGetData(f, 'variant.id'))
+    sub = vid[0:60:3]                       # strided view
+    f.FilterSet(variant_id=sub, verbose=False)
+    got = np.asarray(ps.seqGetData(f, 'variant.id'))
+    assert np.array_equal(got, sub)         # exact same variants
+    # new C-level $-selectors are self-consistent
+    na = np.asarray(ps.seqGetData(f, '$num_allele'))
+    ref = np.asarray(ps.seqGetData(f, '$ref')).astype(str)
+    alt = np.asarray(ps.seqGetData(f, '$alt')).astype(str)
+    allele = np.asarray(ps.seqGetData(f, 'allele')).astype(str)
+    for i in range(len(allele)):
+        parts = allele[i].split(',')
+        assert ref[i] == parts[0]
+        assert alt[i] == (parts[1] if len(parts) > 1 else '.') or len(parts) > 2
+    assert np.array_equal(na, np.array([s.count(',') + 1 for s in allele]))
+    ps.seqClose(f)
+
+
 if __name__ == '__main__':
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
