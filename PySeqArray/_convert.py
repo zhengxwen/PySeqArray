@@ -236,109 +236,118 @@ def seqSNP2GDS(snp_fn, out_fn, compress='LZMA_RA', verbose=True):
 def seqMerge(gds_fns, out_fn, compress='LZMA_RA', verbose=True):
 	"""Merge SeqArray GDS files by concatenating variants (R: seqMerge).
 
-	All input files must contain the same samples (in the same order). The
-	common case of combining per-chromosome files. Annotation INFO/FORMAT
-	fields common to all inputs are carried over.
+	All inputs must share the same samples in the same order (the common case
+	of combining per-chromosome / per-shard files).  INFO/FORMAT fields common
+	to all inputs are carried over.
+
+	Streaming: only ONE input file is open at a time and it is appended to the
+	output through the block-append writer, so this scales to many large shards
+	without opening all files at once or holding the whole dataset in RAM.
 	"""
 	import PySeqArray as ps
+	from PySeqArray._writer import SeqVarGDSWriter
 	if isinstance(gds_fns, str):
 		gds_fns = [gds_fns]
-	files = [ps.seqOpen(fn, allow_dup=True) for fn in gds_fns]
+	if not gds_fns:
+		raise ValueError('seqMerge: no input files')
+
+	def _meta(m):
+		return {'Number': m.get('Number', '.'), 'Type': m.get('Type', 'String'),
+			'Description': m.get('Description', '')}
+
+	# ---- pass 1: samples, common INFO/FORMAT, filter levels, ploidy ----
+	f0 = ps.seqOpen(gds_fns[0], allow_dup=True)
 	try:
-		samp = np.asarray(files[0].GetData('sample.id')).astype(str)
-		for f in files[1:]:
-			s = np.asarray(f.GetData('sample.id')).astype(str)
-			if not np.array_equal(s, samp):
+		samp = np.asarray(f0.GetData('sample.id')).astype(str)
+		info_common = list(f0._list_children('annotation/info'))
+		fmt_common = list(f0._list_children('annotation/format'))
+		info_meta = {nm: _meta(f0._vcf_field_meta('info', nm))
+			for nm in info_common}
+		fmt_meta = {nm: _meta(f0._vcf_field_meta('format', nm))
+			for nm in fmt_common}
+		flevels = f0._filter_levels()
+		fileformat = f0._description_attr('vcf.fileformat') or 'VCFv4.1'
+		nv0 = f0.NumVariant(selected=False)
+		if nv0:
+			m = np.zeros(nv0, dtype=bool)
+			m[0] = True
+			ps.seqSetFilter(f0, variant=m, verbose=False)
+			ploidy = int(np.asarray(f0.GetData('genotype')).shape[2])
+			ps.seqResetFilter(f0, verbose=False)
+		else:
+			ploidy = 2
+	finally:
+		ps.seqClose(f0)
+
+	for fn in gds_fns[1:]:           # intersect common fields, one file at a time
+		f = ps.seqOpen(fn, allow_dup=True)
+		try:
+			if not np.array_equal(np.asarray(f.GetData('sample.id')).astype(str),
+					samp):
 				raise ValueError('seqMerge: all files must share the same '
 					'samples in the same order.')
-		# common INFO / FORMAT fields
-		info_common = set(files[0]._list_children('annotation/info'))
-		fmt_common = set(files[0]._list_children('annotation/format'))
-		for f in files[1:]:
-			info_common &= set(f._list_children('annotation/info'))
-			fmt_common &= set(f._list_children('annotation/format'))
-		info_common = [c for c in files[0]._list_children('annotation/info')
-			if c in info_common]
-		fmt_common = [c for c in files[0]._list_children('annotation/format')
-			if c in fmt_common]
+			ic = set(f._list_children('annotation/info'))
+			fc = set(f._list_children('annotation/format'))
+			info_common = [c for c in info_common if c in ic]
+			fmt_common = [c for c in fmt_common if c in fc]
+		finally:
+			ps.seqClose(f)
+	info_fields = {nm: info_meta[nm] for nm in info_common}
+	fmt_fields = {nm: fmt_meta[nm] for nm in fmt_common}
 
-		# concatenate per-variant columns
-		def cat(name, astype=None):
-			parts = [np.asarray(f.GetData(name)) for f in files]
-			if astype is not None:
-				parts = [p.astype(astype) for p in parts]
-			return np.concatenate(parts)
+	w = SeqVarGDSWriter(out_fn, list(samp), ploidy=ploidy, compress=compress,
+		info_fields=info_fields or None, format_fields=fmt_fields or None,
+		filter_levels=[lv for lv, _d in flevels] or None, fileformat=fileformat)
 
-		chrom = list(cat('chromosome').astype(str))
-		pos = list(cat('position'))
-		vid = list(cat('annotation/id').astype(str))
-		allele = list(cat('allele').astype(str))
+	# ---- pass 2: stream each input into the writer (one open at a time) ----
+	nvar = 0
+	for fn in gds_fns:
+		f = ps.seqOpen(fn, allow_dup=True)
 		try:
-			qual = list(cat('annotation/qual'))
-		except Exception:
-			qual = [np.nan] * len(chrom)
-		try:
-			filt = list(cat('annotation/filter').astype(str))
-		except Exception:
-			filt = ['PASS'] * len(chrom)
-		nSamp = len(samp)
-		geno_blocks, phase_blocks = [], []
-		for f in files:
-			g = np.asarray(f.GetData('genotype'))
-			g = np.where(g == _GENO_NA, 3, g).astype(np.uint8)
-			geno_blocks.extend(g[i] for i in range(g.shape[0]))
+			pos = np.asarray(f.GetData('position'))
+			if pos.shape[0] == 0:
+				continue
+			chrom = np.asarray(f.GetData('chromosome')).astype(str).tolist()
+			allele = np.asarray(f.GetData('allele')).astype(str).tolist()
+			geno = np.asarray(f.GetData('genotype'))   # 255 -> writer treats as missing
 			try:
-				ph = np.asarray(f.GetData('phase'))
-				phase_blocks.extend(ph[i] for i in range(ph.shape[0]))
+				phase = np.asarray(f.GetData('phase'))
 			except Exception:
-				phase_blocks.extend(np.zeros(nSamp, dtype=np.uint8)
-					for _ in range(g.shape[0]))
-		nVar = len(geno_blocks)
-
-		from PySeqArray._vcf_import import _write_gds, _Field
-		# build INFO / FORMAT accumulators across files
-		info_fields_d, info_acc = {}, {}
-		for nm in info_common:
-			meta = files[0]._vcf_field_meta('info', nm)
-			fld = _Field({'ID': nm, 'Number': meta.get('Number', '.'),
-				'Type': meta.get('Type', 'String'),
-				'Description': meta.get('Description', '')})
-			info_fields_d[nm] = fld
-			acc = {'vals': [], 'cnts': []}
-			for f in files:
-				nv = f.NumVariant(selected=True)
-				a = _accumulate_info(f.GetData('annotation/info/' + nm), nv, fld)
-				acc['vals'].extend(a['vals'])
-				acc['cnts'].extend(a['cnts'])
-			info_acc[nm] = acc
-		fmt_fields_d, fmt_acc, fmt_extra = {}, {}, []
-		for nm in fmt_common:
-			meta = files[0]._vcf_field_meta('format', nm)
-			fld = _Field({'ID': nm, 'Number': meta.get('Number', '.'),
-				'Type': meta.get('Type', 'String'),
-				'Description': meta.get('Description', '')})
-			fmt_fields_d[nm] = fld
-			fmt_extra.append(nm)
-			rows = []
-			for f in files:
-				nv = f.NumVariant(selected=True)
-				rows.extend(_accumulate_fmt(
-					f.GetData('annotation/format/' + nm), nv, nSamp))
-			fmt_acc[nm] = {'vals': rows}
-
-		flevels = files[0]._filter_levels()
-		ff = files[0]._description_attr('vcf.fileformat') or 'VCFv4.1'
-		_write_gds(out_fn, ff, list(samp), chrom, pos,
-			[v if v else '.' for v in vid], allele, qual, filt,
-			[lv for lv, _d in flevels], {lv: d for lv, d in flevels},
-			geno_blocks, phase_blocks, 2, info_fields_d, info_acc,
-			fmt_fields_d, fmt_extra, fmt_acc, compress, False)
-	finally:
-		for f in files:
-			f.close()
+				phase = None
+			try:
+				annot_id = np.asarray(
+					f.GetData('annotation/id')).astype(str).tolist()
+			except Exception:
+				annot_id = None
+			try:
+				qual = np.asarray(f.GetData('annotation/qual'))
+			except Exception:
+				qual = None
+			try:
+				filt = np.asarray(
+					f.GetData('annotation/filter')).astype(str).tolist()
+			except Exception:
+				filt = None
+			info = {}
+			for nm in info_common:
+				d = f.GetData('annotation/info/' + nm)
+				info[nm] = ((np.asarray(d['data']), np.asarray(d['index']))
+					if isinstance(d, dict) else np.asarray(d))
+			fmt = {}
+			for nm in fmt_common:
+				d = f.GetData('annotation/format/' + nm)
+				data, idx = np.asarray(d['data']), np.asarray(d['index'])
+				fmt[nm] = (data if str(fmt_fields[nm]['Number']) == '1'
+					else (data, idx))
+			w.append(chrom, pos, allele, geno, phase=phase, annot_id=annot_id,
+				qual=qual, filter=filt, info=info, format=fmt)
+			nvar += pos.shape[0]
+		finally:
+			ps.seqClose(f)
+	w.close()
 	if verbose:
-		print('seqMerge: %d files -> %d variants x %d samples -> %s' %
-			(len(gds_fns), nVar, nSamp, out_fn))
+		print('seqMerge: %d files -> %d variants x %d samples -> %s'
+			% (len(gds_fns), nvar, len(samp), out_fn))
 	return out_fn
 
 
